@@ -1,0 +1,11 @@
+node_modules
+dist
+*.test
+*.out
+*.pprof
+/bin
+.env
+sim/runs
+ts/browser/dist
+# Private: the apps' real rule corpora (see CLAUDE.md)
+/corpus

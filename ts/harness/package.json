@@ -1,0 +1,25 @@
+{
+	"name": "@nightride/localsync-harness",
+	"private": true,
+	"type": "module",
+	"exports": {
+		"./*": "./src/*"
+	},
+	"scripts": {
+		"check": "tsc -p tsconfig.json",
+		"matrix": "node --disable-warning=ExperimentalWarning src/run.ts",
+		"bench": "node --disable-warning=ExperimentalWarning src/bench.ts",
+		"bench:dense": "node --disable-warning=ExperimentalWarning src/bench-dense.ts",
+		"bench:fanout": "node --disable-warning=ExperimentalWarning src/bench-fanout.ts",
+		"bench:deflate": "node --disable-warning=ExperimentalWarning src/bench-deflate.ts",
+		"bench:movein": "node --disable-warning=ExperimentalWarning src/bench-movein.ts"
+	},
+	"dependencies": {
+		"@nightride/localsync": "workspace:*",
+		"@sqlite.org/sqlite-wasm": "3.53.0-build1",
+		"pg": "8.23.1"
+	},
+	"devDependencies": {
+		"@types/pg": "8.23.1"
+	}
+}

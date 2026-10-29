@@ -1,0 +1,25 @@
+{
+	"kinds": [
+		"uuid",
+		"int",
+		"float",
+		"bool",
+		"timestamp",
+		"text",
+		"json",
+		"array",
+		"numeric"
+	],
+	"rows": [
+		{
+			"hex": "00000d1c2b3a00004000800000000000abcd81808080808080209c7500883ce4377e01869accaab6fda5060668c3a96c6c6f107b2261223a205b312c206e756c6c5d7d075b312c322c335d0731322e33343030",
+			"hash": "9763571550355662408",
+			"member": "13897605320740739685"
+		},
+		{
+			"hex": "5601ffffffffffffffffffffffffffffffff0000025b5d",
+			"hash": "13292533087937352633",
+			"member": "7898850028227923452"
+		}
+	]
+}

@@ -1,0 +1,10 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
+		// The page and workers are bundled by esbuild and include localdb's
+		// sources, which use parameter properties.
+		"erasableSyntaxOnly": false
+	},
+	"include": ["src", "run.ts"]
+}

@@ -1,0 +1,38 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"ignorePatterns": [
+		"**/node_modules/**",
+		"**/dist/**",
+		"corpus/**"
+	],
+	"categories": {
+		"correctness": "warn"
+	},
+	"plugins": [
+		"typescript",
+		"eslint",
+		"import",
+		"promise",
+		"node",
+		"unicorn",
+		"oxc"
+	],
+	"rules": {
+		"eslint/no-unused-vars": "error",
+		"unicorn/no-array-for-each": "error",
+		// The harness deliberately String()s unknown values read back from SQLite
+		// replicas to show exactly what was stored; same override as localdb.
+		"typescript/no-base-to-string": "off",
+		"typescript/restrict-template-expressions": "off"
+	},
+	"overrides": [
+		{
+			// The transport runs in browsers and workers: no Node globals.
+			"files": ["ts/transport/src/*.ts"],
+			"excludeFiles": ["ts/transport/src/*.test.ts"],
+			"rules": {
+				"eslint/no-restricted-globals": ["error", "Buffer", "process", "require", "__dirname"]
+			}
+		}
+	]
+}

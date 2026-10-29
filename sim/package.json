@@ -1,0 +1,13 @@
+{
+	"name": "@nightride/localsync-sim",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "tsc -p tsconfig.json",
+		"smash": "node --disable-warning=ExperimentalWarning src/smash.ts",
+		"parallel": "node --disable-warning=ExperimentalWarning src/parallel.ts"
+	},
+	"dependencies": {
+		"@nightride/localsync-harness": "workspace:*"
+	}
+}

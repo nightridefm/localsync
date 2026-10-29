@@ -1,0 +1,9 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		// localdb's own sources (imported as the reference client) reference
+		// browser types such as OPFS handles.
+		"lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"]
+	},
+	"include": ["src"]
+}

@@ -1,0 +1,22 @@
+{
+	"name": "localsync",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "pnpm -r check",
+		"lint": "oxlint --type-aware",
+		"format": "oxfmt",
+		"format:check": "oxfmt --check"
+	},
+	"devDependencies": {
+		"@types/node": "26.2.0",
+		"oxfmt": "0.62.0",
+		"oxlint": "1.77.0",
+		"oxlint-tsgolint": "7.0.2001",
+		"typescript": "7.0.2"
+	},
+	"engines": {
+		"node": ">=26.13.0"
+	},
+	"packageManager": "pnpm@10.27.0"
+}

@@ -1,0 +1,9 @@
+packages:
+  - ts/*
+  - sim
+
+engineStrict: true
+
+# pnpm downloads this Node and uses it for `pnpm run`, `pnpm exec` and
+# `pnpm node`. Keep in step with `engines.node` in package.json.
+useNodeVersion: 26.13.0
