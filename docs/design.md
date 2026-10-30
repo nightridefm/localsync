@@ -506,7 +506,8 @@ optimisation if whole-unit `RESET`s turn out to be common (section 15).
 
 ## 9. Wire format
 
-One WebSocket per client. Binary messages start with a type byte:
+One connection per client: a WebSocket, or HTTP where WebSockets fail
+(section 9.1); the messages are the same. Binary messages start with a type byte:
 `1` FRAME, `2` FRAME_PART (a part of a frame; more follow, and the frame
 ends with a FRAME). The client buffers parts and applies the whole frame
 in one transaction, so a big initial load spans many messages but is
@@ -523,6 +524,7 @@ only on the last piece. Integers are LEB128 varints.
 | engine | `FRAME` | lsn, `[fragment]`; an empty frame just advances the cursor |
 | engine | `ERROR` (JSON) | message |
 | engine | `RESYNC` (JSON) | new epoch: the engine restarted in process; send `WANT` again |
+| engine | `BEAT` (JSON) | nothing sent for 15 s; liveness only |
 
 Control messages are JSON text frames (rare, small); only `FRAME` is
 binary. Unit ids are chosen by the client, one per distinct (rule,
@@ -542,6 +544,50 @@ varints, `bool` in the bitmap, `uuid` 16 bytes, `timestamptz` int64 µs,
 length-prefixed, `json`/`jsonb` as text, arrays as count + elements,
 anything else (PostGIS `geometry`, pgvector `halfvec`) as its text form
 unless projected away. PUT always carries the full projected row.
+
+### 9.1 Transports
+
+- **WebSocket** (`/sync`) is the default. A WANT on the open socket
+  changes the wanted set or refreshes the token.
+- **HTTP** (`/sync/http`) is the same protocol for networks where
+  WebSockets fail: proxies that strip `Upgrade`, cut long-lived sockets,
+  or hold responses until they are complete (antivirus and DLP proxies).
+  - Each request is a connection. Its body is one WANT. Its response
+    streams the engine's messages as records: a kind byte (0 text, 1
+    binary, `0x80` set when the payload is raw deflate), the length as 4
+    bytes little-endian, the payload.
+  - Records of 512 bytes or more are deflated alone, as A15 does on the
+    WebSocket. The response is `application/octet-stream`, so gateways'
+    `gzip_types` leave it alone. Compressing inside the protocol works
+    even where a gateway strips `Accept-Encoding` before forwarding.
+  - A stream ends after 5 minutes. A new WANT (new wants, a fresh token)
+    is a new request. Either way the client re-POSTs at once and resumes
+    from its cursor, which is the WebSocket reconnect path (A16) and
+    costs about a millisecond.
+  - `?mode=poll` ends the response after the first frame with unit data,
+    or after 20 s. Behind a proxy that buffers whole responses, every
+    long poll still delivers, and with no extra latency: the response
+    ends the moment there is something to send.
+  - The engine sends `X-Accel-Buffering: no` (nginx then streams even
+    where `proxy_buffering` is on), `Cache-Control: no-store,
+    no-transform`, and `Access-Control-Allow-Origin: *`. The token is in
+    the body, never a cookie, and a plain-text body needs no CORS
+    preflight.
+- **Choosing** (`SyncClientOptions.transport`, default `auto`):
+  - The client starts on WebSocket. Two WebSocket attempts in a row that
+    never deliver a message switch it to HTTP streaming.
+  - A stream with no message within 5 s is being held back by a proxy:
+    the client switches to long polls.
+  - When HTTP fails too (the engine is down, not the network), the client
+    alternates between transports until one answers.
+  - The mode that works is stored in `_lsync_state`, so the next app load
+    on that database starts there. WebSockets are tried again after 10
+    minutes.
+- **Liveness**: the engine sends `BEAT` on any connection idle for 15 s,
+  because nginx's default `proxy_read_timeout` (60 s) closes idle proxied
+  WebSockets (measured: closed at 60.1 s without beats). The client
+  treats 45 s without any message, or 10 s without an answer to WANT, as
+  a dead connection and reconnects.
 
 ## 10. Client
 
@@ -679,7 +725,9 @@ sends one `WANT` upstream for the union, forwards each client's token to
 the engine for authorisation, keeps per-client frontiers (the same `min`
 rule), and assembles each client's frames from upstream fragments by
 `unit_ref` without decoding rows. Optional: single-node deployments
-connect clients to the engine directly with the same protocol.
+connect clients to the engine directly with the same protocol. Relays
+speak WebSocket only; clients that need HTTP (section 9.1) connect to
+the engine.
 
 ## 14. Verification: harness and simulation
 
@@ -736,7 +784,36 @@ continuous samplers.
 - Shrinking: delta-debug failing op sequences; interleavings are not
   deterministic, so each candidate runs several times.
 
-### 14.3 Benchmarks
+### 14.3 Through a TLS gateway
+
+`docker/gateway` is nginx configured like the apps' gateways: HTTP/2 and
+HTTP/3, gzip on, nginx's default proxy timeouts and buffering. It serves
+a real certificate for a name that resolves to 127.0.0.1, so tests run
+over `wss://` and `https://` exactly as browsers reach the apps.
+
+- **Harness and simulation**: `LOCALSYNC_URL` and `LOCALSYNC_TRANSPORT`
+  route every client through it. The catalogue passes 23/23 over WSS
+  through nginx, and 23/23 over HTTP streaming and over long polls.
+  20/20 fault-simulation seeds pass over HTTP.
+- **`pnpm ... gateway`** checks four cases, each with a load of 2,000
+  tasks and comments, 75 s idle, then timed updates:
+
+  | Case | Mode | Load | Update p50 |
+  | --- | --- | --- | --- |
+  | WebSocket over WSS | WebSocket | 153 ms | 2 ms |
+  | HTTP streaming over HTTPS | stream | 97 ms | 2 ms |
+  | `auto` through the gateway | WebSocket | 152 ms | 2 ms |
+  | `auto` through a hostile middlebox | poll | 5,350 ms | 3 ms |
+
+  - The first three survive 75 s idle without a reconnect.
+  - The middlebox refuses WebSocket upgrades and holds every response
+    until it is complete. The hostile load is slow only the first time:
+    a reload on the same database resumes in poll mode in 39 ms.
+- **Browser**: `LOCALSYNC_BROWSER_VIA=gateway` (or `hostile`) serves the
+  smoke and the collab soak from one `https://` origin through the
+  gateway. All four cases pass, with 0 torn renders on aligned tabs.
+
+### 14.4 Benchmarks
 
 Both engines: initial load time and bytes, change latency p50/p99,
 bytes per change, reconnect bytes after a deploy, engine CPU/RSS at N
@@ -765,8 +842,8 @@ each is adopted only when a benchmark asks for it.
 
 ## 16. Phases
 
-Status as of 2026-10-29: 0 to 4 done; 6 started (localdb transport);
-5 not started.
+Status as of 2026-10-30: 0 to 4 done; 6 started (localdb transport,
+`alignCommits`, HTTP fallback and gateway checks done); 5 not started.
 
 0. Skeleton, compose, this document. **Done.**
 1. Harness + Electric baseline (section 14.1), first benchmarks.
@@ -842,6 +919,19 @@ each found by building or by the harness:
   now forbids Node globals in `ts/transport/src`.
 - **Waiting clients already share one snapshot query**, so a cache only
   helps clients that arrive after the query finished (section 8).
+- **nginx closes idle WebSockets at 60 s** (`proxy_read_timeout`), which
+  is the default on most routes an app would mount the engine on. Hence
+  the `BEAT` messages (section 9.1).
+- **nginx's `proxy_buffering` does not hold a stream**: it still forwards
+  data as it arrives. The hostile case needs a real holding proxy
+  (`ts/harness/src/middlebox.ts`).
+- **The gateway exposed a race in localdb**: in `multi` mode a reader
+  opened its connection outside the read fence. When the first sync
+  frame landed while readers booted, a torn header read poisoned the
+  reader for good (`SQLITE_CORRUPT` on every query, since fence mode
+  never reopens). It failed 9 of 18 browser runs through the gateway
+  and 0 direct, where the timing differs. The open now takes the fence:
+  0 of 9 failed (`reader.worker.ts`, uncommitted in `../localdb`).
 
 ## Decisions
 
@@ -950,6 +1040,24 @@ Agreed with the user on 2026-10-29, amending the plan where noted.
   the marks were removed. Off by default (live-query parallelism matters
   for heavy aggregates); screens in either app that combine queries
   should turn it on.
+
+- **A21. HTTP fallback, no WebTransport.**
+  - App A runs on Electric today, which works over plain HTTP. Moving
+    App A to WebSocket-only sync would break it on every customer network
+    where Electric works only because it is plain HTTP. So `/sync/http`
+    (section 9.1) ships with the engine, chosen automatically by the
+    client.
+  - It is one mode that degrades to long polls, not streaming alone,
+    because the proxies that break WebSockets often also buffer
+    responses.
+  - WebTransport (QUIC) is not planned:
+    - Its benefits are separate streams, connection migration and 0-RTT.
+      We deliver one ordered stream per client by design, and a resume
+      already costs about a millisecond.
+    - UDP is often blocked on enterprise networks, so it would need this
+      fallback anyway.
+    - QUIC in Go runs in user space, so it costs more CPU per connection.
+  - Revisit if measured mobile reconnects matter.
 
 ## Open questions
 

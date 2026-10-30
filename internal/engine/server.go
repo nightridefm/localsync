@@ -1,26 +1,33 @@
 package engine
 
 import (
+	"bytes"
+	"compress/flate"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// Handler serves /sync (WebSocket), /health and /debug/units.
+// Handler serves /sync (WebSocket), /sync/http (the same protocol over
+// HTTP streaming or long polling), /health and /debug/units.
 func (e *Engine) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sync", e.serveSync)
+	mux.HandleFunc("/sync/http", e.serveHTTP)
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
@@ -123,40 +130,17 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		defer cancel()
-		for {
-			select {
-			case m := <-c.out:
-				typ := websocket.MessageBinary
-				if m.text {
-					typ = websocket.MessageText
-				}
-				wctx, wcancel := context.WithTimeout(ctx, 30*time.Second)
-				err := conn.Write(wctx, typ, m.data)
-				wcancel()
-				if c.queued.Add(-int64(len(m.data))) < lowWater && c.pumping.CompareAndSwap(false, true) {
-					// Queue drained: let the engine queue the next parts.
-					e.Do(func() {
-						c.pumping.Store(false)
-						e.pump(c)
-					})
-				}
-				if err != nil {
-					return
-				}
-			case <-c.done:
-				// Flush what is queued (e.g. a final error), then close.
-				for {
-					select {
-					case m := <-c.out:
-						_ = conn.Write(ctx, websocket.MessageText, m.data)
-					default:
-						conn.Close(websocket.StatusPolicyViolation, "closed by engine")
-						return
-					}
-				}
-			case <-ctx.Done():
-				return
+		write := func(m outMsg) error {
+			typ := websocket.MessageBinary
+			if m.text {
+				typ = websocket.MessageText
 			}
+			wctx, wcancel := context.WithTimeout(ctx, 30*time.Second)
+			defer wcancel()
+			return conn.Write(wctx, typ, m.data)
+		}
+		if e.writeLoop(ctx, c, write, nil, nil) {
+			conn.Close(websocket.StatusPolicyViolation, "closed by engine")
 		}
 	}()
 
@@ -186,4 +170,189 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 			}
 		})
 	}
+}
+
+// writeLoop writes the client's queued messages until the connection ends
+// (ctx), a write fails, the engine closes the client (it then flushes what
+// is queued, e.g. a final error, and returns true), or the response should
+// end: stop returns true after a message, or deadline fires. Neither ends
+// the loop inside a frame sent in parts: the client applies a frame only
+// whole, and a cut one would be wasted.
+func (e *Engine) writeLoop(ctx context.Context, c *Client, write func(outMsg) error, stop func(outMsg) bool, deadline <-chan time.Time) bool {
+	inFrame, expired := false, false
+	for {
+		select {
+		case m := <-c.out:
+			err := write(m)
+			if c.queued.Add(-int64(len(m.data))) < lowWater && c.pumping.CompareAndSwap(false, true) {
+				// Queue drained: let the engine queue the next parts.
+				e.Do(func() {
+					c.pumping.Store(false)
+					e.pump(c)
+				})
+			}
+			if err != nil {
+				return false
+			}
+			if !m.text {
+				inFrame = m.part
+			}
+			if !inFrame && (expired || (stop != nil && stop(m))) {
+				return false
+			}
+		case <-c.done:
+			for {
+				select {
+				case m := <-c.out:
+					_ = write(m)
+				default:
+					return true
+				}
+			}
+		case <-deadline:
+			deadline = nil
+			if !inFrame {
+				return false
+			}
+			expired = true
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// untilUnits ends a long poll once a frame with unit data has gone out
+// (writeLoop ends it after the frame's last part).
+func untilUnits() func(outMsg) bool {
+	units := false
+	return func(m outMsg) bool {
+		units = units || m.units
+		return units
+	}
+}
+
+const (
+	// A streamed response ends after streamMax (the client re-POSTs at
+	// once and resumes from its cursor), so no proxy's limit on response
+	// duration is ever reached; a long poll after pollMax at most.
+	streamMax = 5 * time.Minute
+	pollMax   = 20 * time.Second
+	// Records of this size or more are deflated, like permessage-deflate
+	// on the WebSocket (no context kept between records).
+	recordDeflateMin = 512
+	recText          = 0
+	recBinary        = 1
+	recDeflated      = 0x80
+)
+
+var flatePool = sync.Pool{New: func() any {
+	w, _ := flate.NewWriter(nil, flate.BestSpeed)
+	return w
+}}
+
+// appendRecord frames one protocol message for /sync/http: a kind byte
+// (text or binary, 0x80 set when the payload is raw deflate), the payload
+// length as 4 bytes little-endian, the payload.
+func appendRecord(dst []byte, m outMsg) []byte {
+	kind := byte(recBinary)
+	if m.text {
+		kind = recText
+	}
+	payload := m.data
+	if len(payload) >= recordDeflateMin {
+		var b bytes.Buffer
+		fw := flatePool.Get().(*flate.Writer)
+		fw.Reset(&b)
+		_, _ = fw.Write(payload)
+		_ = fw.Close()
+		flatePool.Put(fw)
+		if b.Len() < len(payload) {
+			kind |= recDeflated
+			payload = b.Bytes()
+		}
+	}
+	dst = append(dst, kind)
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(payload)))
+	return append(dst, payload...)
+}
+
+// serveHTTP is the protocol over plain HTTP, for networks where WebSockets
+// fail (proxies that strip Upgrade or cut long-lived sockets). The request
+// body is one WANT; the response streams the same messages a WebSocket
+// would carry, as records (appendRecord), and then ends. Each request is a
+// connection: a new WANT (new wants, a fresh token) is a new request that
+// resumes from the client's cursor, as a WebSocket reconnect does.
+//
+// ?mode=poll is for proxies that buffer responses: the response ends after
+// the first frame with unit data (or pollMax), so buffering only delays it
+// until it ends.
+func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	// The token is in the body, never a cookie, so any origin may call.
+	h.Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodOptions {
+		h.Set("Access-Control-Allow-Methods", "POST")
+		h.Set("Access-Control-Allow-Headers", "Content-Type")
+		h.Set("Access-Control-Max-Age", "86400")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST a WANT", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	var m wantMsg
+	if err == nil {
+		err = json.Unmarshal(body, &m)
+	}
+	if err != nil || m.Type != "want" {
+		http.Error(w, "bad WANT", http.StatusBadRequest)
+		return
+	}
+	poll := r.URL.Query().Get("mode") == "poll"
+	// octet-stream: the gateways' gzip_types leave it alone (records are
+	// already compressed); no-transform for other proxies; nginx streams
+	// the response as written when it sees X-Accel-Buffering: no.
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Cache-Control", "no-store, no-transform")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	_ = rc.Flush()
+
+	ctx := r.Context()
+	c := &Client{e: e, out: make(chan outMsg, 4096), done: make(chan struct{})}
+	e.Do(func() { e.addClient(c) })
+	defer e.Do(func() { e.removeClient(c) })
+	sub, exp, err := e.verify(m.Token)
+	if err != nil {
+		slog.Info("auth rejected", "err", err)
+		e.Do(func() { c.fail("auth: " + err.Error()) })
+	} else {
+		e.Do(func() {
+			if !c.closed {
+				c.exp = exp
+				e.want(c, sub, &m)
+			}
+		})
+	}
+
+	var buf []byte
+	write := func(m outMsg) error {
+		buf = appendRecord(buf[:0], m)
+		_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if _, err := w.Write(buf); err != nil {
+			return err
+		}
+		return rc.Flush()
+	}
+	var stop func(outMsg) bool
+	limit := streamMax
+	if poll {
+		limit, stop = pollMax, untilUnits()
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	e.writeLoop(ctx, c, write, stop, timer.C)
 }

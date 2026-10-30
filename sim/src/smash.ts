@@ -124,8 +124,12 @@ async function checkpoint(label: string) {
 				`${label}: client p${i} (sub ${s.conn.principal.sub}): ${(err as Error).message}`
 			)
 		}
-		const drift = s.conn.client.errors().filter((e) => e.includes('drift'))
-		if (drift.length) throw new Fail(`${label}: client p${i}: ${drift[0]}`)
+		const errors = s.conn.client.errors()
+		const d = errors.findIndex((e) => e.includes('drift'))
+		if (d >= 0)
+			throw new Fail(
+				`${label}: client p${i}: ${errors[d]}; errors before it: ${JSON.stringify(errors.slice(Math.max(0, d - 5), d))}`
+			)
 		if (s.torn) throw new Fail(`${label}: client p${i} saw ${s.torn} torn transactions`)
 		s.conn.verifyNoLeaks()
 	}

@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { type Db as SyncDb, type SqlValue, SyncClient } from '@nightride/localsync'
+import { type ConnMode, type Db as SyncDb, type SqlValue, SyncClient } from '@nightride/localsync'
 
 import type { Adapter, Client } from './adapter.ts'
 import type { Catalog } from './catalog.ts'
@@ -20,6 +20,13 @@ const REPO = path.resolve(import.meta.dirname, '../../..')
 const SECRET = 'harness-secret'
 const PORT = Number(process.env.LOCALSYNC_ENGINE_PORT ?? 3141)
 const DEBUG = !!process.env.HARNESS_DEBUG
+// Clients may reach the engine through a gateway (docker/gateway):
+// LOCALSYNC_URL is the ws(s):// /sync URL (default: the engine directly),
+// LOCALSYNC_HTTP_URL the /sync/http one, LOCALSYNC_TRANSPORT websocket
+// (default here, so runs are deterministic), http or auto.
+const URL_ = process.env.LOCALSYNC_URL ?? `ws://127.0.0.1:${PORT}/sync`
+const HTTP_URL = process.env.LOCALSYNC_HTTP_URL
+const TRANSPORT = (process.env.LOCALSYNC_TRANSPORT ?? 'websocket') as 'websocket' | 'http' | 'auto'
 
 // Engines started by this process: killed when it exits, so an interrupted
 // run never leaves one holding the port (which would then answer the next
@@ -72,19 +79,30 @@ function yamlRules(rules: Map<string, Rule>): string {
 	return `${lines.join('\n')}\n`
 }
 
-class LocalsyncClient implements Client {
+/** How clients reach the engine (defaults: the environment, see above). */
+export type ConnOptions = {
+	/** WebSocket class (benchmarks wrap it to see raw messages). */
+	WebSocket?: typeof WebSocket
+	url?: string
+	httpUrl?: string
+	transport?: 'websocket' | 'http' | 'auto'
+}
+
+export class LocalsyncClient implements Client {
 	readonly replica: Replica
 	private sync: SyncClient
 	private listeners = new Set<() => void>()
 	private received = 0
 	private bounds: Bound[]
 
-	constructor(replica: Replica, sub: string, bounds: Bound[], ws?: typeof WebSocket) {
+	constructor(replica: Replica, sub: string, bounds: Bound[], conn: ConnOptions) {
 		this.replica = replica
 		this.bounds = bounds
 		this.sync = new SyncClient({
-			WebSocket: ws,
-			url: `ws://127.0.0.1:${PORT}/sync`,
+			WebSocket: conn.WebSocket,
+			url: conn.url ?? URL_,
+			httpUrl: conn.httpUrl ?? HTTP_URL,
+			transport: conn.transport ?? TRANSPORT,
 			token: () => mintToken(sub),
 			db: wrap(replica.db),
 			onCommit: () => {
@@ -118,6 +136,11 @@ class LocalsyncClient implements Client {
 		const file = path.join(REPO, 'sim/runs', `drift-${sub}-${Date.now()}.json`)
 		writeFileSync(file, JSON.stringify({ sub, units, members, engine, rows }, null, 1))
 		console.error(`[localsync] drift dump: ${file}`)
+	}
+
+	/** The transport the client is using now. */
+	get connMode(): ConnMode {
+		return this.sync.connMode
 	}
 
 	private wantsOf(bounds: Bound[]) {
@@ -166,11 +189,10 @@ export class LocalsyncAdapter implements Adapter {
 	private registered = new Map<string, Rule>()
 	private clients = new Set<LocalsyncClient>()
 	private dir = mkdtempSync(path.join(tmpdir(), 'localsync-harness-'))
-	/** WebSocket class for clients (benchmarks wrap it to see raw messages). */
-	private ws: typeof WebSocket | undefined
+	private conn: ConnOptions
 
-	constructor(opts: { WebSocket?: typeof WebSocket } = {}) {
-		this.ws = opts.WebSocket
+	constructor(conn: ConnOptions = {}) {
+		this.conn = conn
 	}
 
 	private async start(): Promise<void> {
@@ -248,7 +270,7 @@ export class LocalsyncAdapter implements Adapter {
 			await this.stop()
 			await this.start()
 		}
-		const c = new LocalsyncClient(await Replica.open(catalog), principal.sub, bounds, this.ws)
+		const c = new LocalsyncClient(await Replica.open(catalog), principal.sub, bounds, this.conn)
 		this.clients.add(c)
 		return c
 	}

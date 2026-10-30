@@ -63,5 +63,25 @@ services:
       postgres:
         condition: service_healthy
 
+  gateway:
+    # TLS gateway (nginx, like the apps') for wss:// and https:// tests;
+    # only with `--profile gateway`. Needs a certificate for a name that
+    # resolves to 127.0.0.1, from an existing Let's Encrypt volume, set in
+    # .env (gitignored): LOCALSYNC_TLS_VOLUME, LOCALSYNC_TLS_DOMAIN.
+    # Host networking: it reaches the engines the harness and the browser
+    # tests start on 127.0.0.1, and serves 8443 and 8444 (TCP and QUIC).
+    profiles: [gateway]
+    image: nginx:1.29-alpine
+    network_mode: host
+    environment:
+      LOCALSYNC_TLS_DOMAIN: ${LOCALSYNC_TLS_DOMAIN:-localhost}
+    volumes:
+      - ./docker/gateway/templates:/etc/nginx/templates:ro
+      - ./docker/gateway/snippets:/etc/nginx/snippets:ro
+      - tls:/etc/letsencrypt:ro
+
 volumes:
   pgdata:
+  tls:
+    external: true
+    name: ${LOCALSYNC_TLS_VOLUME:-localsync_tls}

@@ -2,7 +2,13 @@
 // protocol and applies frames to any SQLite handle; localsyncTransport plugs
 // it into localdb's writer worker (see localdb.ts).
 export { Applier, type ApplyResult, type Db, STATE_DDL } from './apply.ts'
-export { type Run, SyncClient, type SyncClientOptions, type Want } from './client.ts'
+export {
+	type ConnMode,
+	type Run,
+	SyncClient,
+	type SyncClientOptions,
+	type Want,
+} from './client.ts'
 export {
 	type ColumnDesc,
 	decodeFrame,

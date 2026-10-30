@@ -14,7 +14,16 @@ import { ensureFixture, resetData, seedWorld } from '@nightride/localsync-harnes
 import { mintToken } from '@nightride/localsync-harness/localsync.ts'
 import { Db, type Query } from '@nightride/localsync-harness/pg.ts'
 
-import { cdpPage, ENGINE_PORT, HTTP_PORT, shutdown, sleep, startStack, waitFor } from './infra.ts'
+import {
+	cdpPage,
+	PAGE_ORIGIN,
+	SYNC_URL,
+	TRANSPORT,
+	shutdown,
+	sleep,
+	startStack,
+	waitFor,
+} from './infra.ts'
 
 const { values } = parseArgs({
 	options: {
@@ -111,12 +120,13 @@ async function main(): Promise<void> {
 	for (const t of tabs) {
 		const qs = new URLSearchParams({
 			run: randomUUID().slice(0, 8),
-			ws: `ws://127.0.0.1:${ENGINE_PORT}/sync`,
+			ws: SYNC_URL,
+			transport: TRANSPORT,
 			token: mintToken(t.sub, { expSeconds: 3600 }),
 			align: t.align ? '1' : '0',
 			projects: world.projects.join(','),
 		})
-		pages.push(await cdpPage(`http://127.0.0.1:${HTTP_PORT}/collab.html?${qs}`))
+		pages.push(await cdpPage(`${PAGE_ORIGIN}/collab.html?${qs}`))
 	}
 	const stats = async (i: number): Promise<Stats> => {
 		const raw = (await pages[i]!.evaluate('JSON.stringify(window.__collab || null)')) as string

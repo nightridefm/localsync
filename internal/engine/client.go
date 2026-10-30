@@ -19,6 +19,11 @@ import (
 type outMsg struct {
 	text bool
 	data []byte
+	// part: more parts of this frame follow. units: the message carries
+	// unit data (an empty frame only advances the cursor). A long-poll
+	// response ends after a whole frame with units (serveHTTP).
+	part  bool
+	units bool
 }
 
 // Client is one connection. Owned by the engine loop; the WebSocket
@@ -47,6 +52,9 @@ type Client struct {
 	// exp is the current token's expiry. Past it the client gets nothing
 	// more: it must send a WANT with a fresh token before then.
 	exp time.Time
+	// lastSend: when the engine last queued a message; an idle connection
+	// gets a beat so proxies' read timeouts (nginx: 60s) never cut it.
+	lastSend time.Time
 }
 
 // Hold is a client's view of one unit: waiting for a snapshot, holding an
@@ -222,6 +230,7 @@ func (c *Client) send(m outMsg) {
 	select {
 	case c.out <- m:
 		c.queued.Add(int64(len(m.data)))
+		c.lastSend = time.Now()
 	default:
 		// A client that cannot keep up reconnects and reconciles.
 		c.fail("client too slow")
@@ -241,6 +250,7 @@ func (c *Client) fail(msg string) {
 }
 
 func (e *Engine) addClient(c *Client) {
+	c.lastSend = time.Now()
 	e.clients[c] = struct{}{}
 }
 
@@ -438,8 +448,18 @@ func (e *Engine) heartbeat() {
 			continue
 		}
 		e.frame(c, true)
+		if now.Sub(c.lastSend) >= beatEvery {
+			c.sendJSON(beatMsg)
+		}
 	}
 }
+
+// beatEvery: an idle connection gets a beat this often. Proxies cut idle
+// connections (nginx's proxy_read_timeout defaults to 60s) and the client
+// treats three missed beats as a dead connection.
+const beatEvery = 15 * time.Second
+
+var beatMsg = map[string]string{"type": "beat"}
 
 func (e *Engine) frame(c *Client, empty bool) {
 	if c.holds == nil || c.stream != nil || (!c.exp.IsZero() && time.Now().After(c.exp)) {
@@ -614,7 +634,7 @@ func (e *Engine) pump(c *Client) {
 			c.stream = nil
 		}
 		buf := wire.AppendPartHeader(make([]byte, 0, len(body)+16), msg, s.lsn, units)
-		c.send(outMsg{data: append(buf, body...)})
+		c.send(outMsg{data: append(buf, body...), part: msg == wire.MsgFramePart, units: units > 0})
 	}
 }
 

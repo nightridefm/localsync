@@ -11,7 +11,16 @@ import { ensureFixture, resetData, seedWorld } from '@nightride/localsync-harnes
 import { mintToken } from '@nightride/localsync-harness/localsync.ts'
 import { Db } from '@nightride/localsync-harness/pg.ts'
 
-import { cdpPage, ENGINE_PORT, HTTP_PORT, shutdown, sleep, startStack, waitFor } from './infra.ts'
+import {
+	cdpPage,
+	PAGE_ORIGIN,
+	SYNC_URL,
+	TRANSPORT,
+	shutdown,
+	sleep,
+	startStack,
+	waitFor,
+} from './infra.ts'
 
 type Ev = [string, ...unknown[]]
 
@@ -32,11 +41,12 @@ async function main(): Promise<void> {
 	const open = async (align: boolean) => {
 		const qs = new URLSearchParams({
 			run: randomUUID().slice(0, 8),
-			ws: `ws://127.0.0.1:${ENGINE_PORT}/sync`,
+			ws: SYNC_URL,
+			transport: TRANSPORT,
 			token: mintToken(sub),
 			align: align ? '1' : '0',
 		})
-		const page = await cdpPage(`http://127.0.0.1:${HTTP_PORT}/?${qs}`)
+		const page = await cdpPage(`${PAGE_ORIGIN}/?${qs}`)
 		const events = async (): Promise<Ev[]> => {
 			const raw = (await page.evaluate(
 				'JSON.stringify({e: window.__events || [], err: window.__error})'

@@ -40,6 +40,7 @@ const db = new LocalDb(
 			options: {
 				url: params.get('ws'),
 				token: params.get('token'),
+				transport: params.get('transport') || undefined,
 				wants: [{ rule: 'tasks' }, { rule: 'comments' }],
 			},
 		},

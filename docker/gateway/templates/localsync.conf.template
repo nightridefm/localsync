@@ -1,0 +1,49 @@
+# TLS gateway in front of the engine, configured like the apps' nginx
+# gateways (HTTP/2 + HTTP/3, gzip on, default proxy timeouts), so the
+# harness and the browser tests run over wss:// and https:// with a real
+# certificate. Compose profile `gateway`; see docker/gateway/README.md.
+# ${VARS} are filled from the environment when the container starts.
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 5;
+gzip_min_length 256;
+gzip_types application/javascript application/json application/wasm text/css text/plain text/xml;
+
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_certificate /etc/letsencrypt/live/${LOCALSYNC_TLS_DOMAIN}/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/${LOCALSYNC_TLS_DOMAIN}/privkey.pem;
+
+# The harness's engine (LOCALSYNC_ENGINE_PORT, default 3141).
+server {
+    listen 8443 ssl;
+    listen 8443 quic reuseport;
+    http2 on;
+    server_name ${LOCALSYNC_TLS_DOMAIN};
+    add_header Alt-Svc 'h3=":8443"; ma=86400' always;
+    set $engine 127.0.0.1:3141;
+    include /etc/nginx/snippets/sync.conf;
+}
+
+# The browser tests: their engine (3142) and their pages (8078), one origin.
+server {
+    listen 8444 ssl;
+    listen 8444 quic reuseport;
+    http2 on;
+    server_name ${LOCALSYNC_TLS_DOMAIN};
+    add_header Alt-Svc 'h3=":8444"; ma=86400' always;
+    set $engine 127.0.0.1:3142;
+    include /etc/nginx/snippets/sync.conf;
+
+    location / {
+        proxy_pass http://127.0.0.1:8078;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}

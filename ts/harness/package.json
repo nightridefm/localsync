@@ -12,7 +12,8 @@
 		"bench:dense": "node --disable-warning=ExperimentalWarning src/bench-dense.ts",
 		"bench:fanout": "node --disable-warning=ExperimentalWarning src/bench-fanout.ts",
 		"bench:deflate": "node --disable-warning=ExperimentalWarning src/bench-deflate.ts",
-		"bench:movein": "node --disable-warning=ExperimentalWarning src/bench-movein.ts"
+		"bench:movein": "node --disable-warning=ExperimentalWarning src/bench-movein.ts",
+		"gateway": "node --disable-warning=ExperimentalWarning --env-file-if-exists=../../.env src/gateway.ts"
 	},
 	"dependencies": {
 		"@nightride/localsync": "workspace:*",

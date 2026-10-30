@@ -42,6 +42,10 @@ export type LocalsyncOptions = {
 	/** A fixed token (tests). */
 	token?: string
 	wants: Want[]
+	/** 'auto' (default) falls back to HTTP where WebSockets fail. */
+	transport?: 'auto' | 'websocket' | 'http'
+	/** The engine's /sync/http URL; default derived from `url`. */
+	httpUrl?: string
 }
 
 async function fetchToken(opts: LocalsyncOptions): Promise<string> {
@@ -56,6 +60,8 @@ export function localsyncTransport(ctx: TransportContext, options: unknown): Tra
 	const opts = options as LocalsyncOptions
 	const client = new SyncClient({
 		url: opts.url,
+		httpUrl: opts.httpUrl,
+		transport: opts.transport,
 		token: () => fetchToken(opts),
 		run: ctx.run,
 		onCommit: (tables, rows) => ctx.committed([...tables], rows),

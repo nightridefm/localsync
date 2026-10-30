@@ -8,6 +8,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { RULES } from '@nightride/localsync-harness/fixture.ts'
+import { startMiddlebox } from '@nightride/localsync-harness/middlebox.ts'
 import { PG_URL } from '@nightride/localsync-harness/pg.ts'
 
 import { buildSmoke } from './build.ts'
@@ -17,6 +18,20 @@ export const REPO = path.resolve(ROOT, '../..')
 export const HTTP_PORT = 8078
 export const ENGINE_PORT = 3142
 const CDP_PORT = 9224
+
+// Where the tabs load the page and reach the engine (LOCALSYNC_BROWSER_VIA):
+// direct (default), gateway (the TLS gateway, docker/gateway: page and
+// sync on one https:// origin) or hostile (the gateway's /hostile/ path,
+// through a middlebox that refuses WebSockets and buffers responses).
+// LOCALSYNC_TRANSPORT (websocket, http, auto) is passed to the transport.
+const VIA = process.env.LOCALSYNC_BROWSER_VIA ?? 'direct'
+const GATEWAY = `${process.env.LOCALSYNC_TLS_DOMAIN}:8444`
+export const PAGE_ORIGIN = VIA === 'direct' ? `http://127.0.0.1:${HTTP_PORT}` : `https://${GATEWAY}`
+export const SYNC_URL =
+	VIA === 'direct'
+		? `ws://127.0.0.1:${ENGINE_PORT}/sync`
+		: `wss://${GATEWAY}${VIA === 'hostile' ? '/hostile' : ''}/sync`
+export const TRANSPORT = process.env.LOCALSYNC_TRANSPORT ?? ''
 const SQLITE = realpathSync(path.join(ROOT, 'node_modules/@sqlite.org/sqlite-wasm'))
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -153,6 +168,10 @@ export async function startStack(rules: string[]): Promise<void> {
 	)
 	const server = serve()
 	cleanup.push(() => server.close())
+	if (VIA === 'hostile') {
+		const box = await startMiddlebox()
+		cleanup.push(() => box.close())
+	}
 	const chrome = spawn(
 		process.env.CHROME_BIN ?? 'google-chrome',
 		[
