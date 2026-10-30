@@ -438,6 +438,14 @@ answers per unit:
 | unit not held | `RESET` + rows |
 | unit held but not in the wants | nothing from the engine; the client drops it inside the next frame's transaction (the engine forces one) |
 
+Haves describe the principal they were synced for: the client names each
+unit by (rule, params, the token's `sub`), so when another user signs in
+on the same local database (sign out and in, an admin's masquerade) none
+of the first user's units match. They are held but not wanted, so the
+first frame drops them, and the new user's units arrive whole (catalogue
+7b). Naming units by rule and params alone resumed the first user's
+state as the second's: a leak, found by App B's shadow comparison.
+
 Haves count only on a connection's first `WANT`. Later `WANT`s on the
 same connection (a project switch, a token refresh) keep the holds they
 share with the last one untouched, and a hold that is new gets `RESET` +
@@ -555,7 +563,9 @@ only on the last piece. Integers are LEB128 varints.
 
 Control messages are JSON text frames (rare, small); only `FRAME` is
 binary. Unit ids are chosen by the client, one per distinct (rule,
-params) and never reused, so a want that changes parameters is a new id.
+params, principal) and never reused, so a want that changes parameters is
+a new id, and so is the same want for someone else on the same local
+database (section 7).
 
 ```
 fragment = unit_ref len ops
@@ -567,7 +577,7 @@ row      = null_bitmap value*          positional, the unit's columns
 
 Values are typed by the descriptor, never self-describing: zigzag
 varints, `bool` in the bitmap, `uuid` 16 bytes, `timestamptz` int64 µs,
-`date` varint days, `float8` 8 bytes, `numeric` as text, `text`/`bytea`
+`date` as its text form (`2026-07-03`, as the Electric path stores it), `float8` 8 bytes, `numeric` as text, `text`/`bytea`
 length-prefixed, `json`/`jsonb` as text, arrays as count + elements,
 anything else (PostGIS `geometry`, pgvector `halfvec`) as its text form
 unless projected away. PUT always carries the full projected row.
@@ -959,6 +969,13 @@ each found by building or by the harness:
     again, and its next delta read as drift. The smash simulation found
     it (seed 213, only under four parallel jobs). Removals now mark the
     unit not held (`apply.test.ts` replays the ordering).
+- **Local state belongs to a principal**: App B's shadow comparison
+  signed users in one after another in one browser, sharing one local
+  database file. Units named by (rule, params) took one curator's synced
+  state for the next curator's, and the engine resumed it (its units were
+  warm). Electric avoided it only because App B's proxy puts the user id
+  into each shape's `where`. Units are now named per principal (section
+  7, catalogue 7b).
 - **nginx closes idle WebSockets at 60 s** (`proxy_read_timeout`), which
   is the default on most routes an app would mount the engine on. Hence
   the `BEAT` messages (section 9.1).

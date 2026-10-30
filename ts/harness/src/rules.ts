@@ -90,7 +90,8 @@ export function bind(rule: Rule, principal: Principal, want: Want): Bound {
 		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
 		.map(([k, v]) => `${k}=${v}`)
 	return {
-		key: [rule.name, ...params].join('|'),
+		// The principal too: another user's want is another subscription.
+		key: [rule.name, ...params, principal.sub].join('|'),
 		rule,
 		params: want.params ?? {},
 		table: m[2]!.replaceAll('"', ''),

@@ -249,6 +249,37 @@ export const catalogue: Scenario[] = [
 		},
 	},
 	{
+		id: '7b',
+		title: 'another user signs in on the same local database',
+		async run(ctx) {
+			const a = ctx.principal('a')
+			const b = ctx.principal('b')
+			await ctx.write(async (q) => {
+				await seedWorld(q, {
+					orgs: 2,
+					projects: 1,
+					tasks: 50,
+					comments: 1,
+					memberOf: [[a.sub], [b.sub]],
+				})
+			})
+			const wants = ['projects', 'tasks', 'comments', 'members']
+			// B's units are warm on the engine (B is signed in elsewhere).
+			const elsewhere = await ctx.connect(b, wants)
+			await ctx.converge(elsewhere)
+			const c = await ctx.connect(a, wants)
+			await ctx.converge(c)
+			// Sign out A, sign in B on the same replica: it must hold exactly
+			// B's rows, none of A's (resuming A's state as B's was a leak).
+			await c.client.disconnect()
+			a.sub = b.sub
+			await c.client.reconnect()
+			await c.want(wants.map((rule) => ({ rule })))
+			const ms = await ctx.converge(c)
+			return `replica switched to the other user in ${ms}ms, none of the first user's rows left`
+		},
+	},
+	{
 		id: '8',
 		title: 'server restart: converge, no loss',
 		async run(ctx) {

@@ -114,7 +114,10 @@ export class LocalsyncClient implements Client {
 			transport: conn.transport ?? TRANSPORT,
 			// Read at every mint: a scenario may change the grants, which the
 			// engine checks at the next WANT (a token refresh).
-			token: () => mintToken(sub, { grants: principal.claims?.grants as string[] | undefined }),
+			// principal.sub too: a scenario may sign someone else in on this
+			// replica (catalogue 7b).
+			token: () =>
+				mintToken(principal.sub, { grants: principal.claims?.grants as string[] | undefined }),
 			db: wrap(replica.db),
 			onCommit: () => {
 				for (const l of this.listeners) l()

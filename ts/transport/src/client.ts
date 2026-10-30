@@ -63,11 +63,30 @@ const idleMs = 45_000
 const wsFailLimit = 2
 const wsRetryMs = 10 * 60_000
 
-const defKey = (w: Want) =>
+// A unit is a rule, its parameters and the principal: the same rule for
+// someone else (another user signing in on this database, a masquerade) is
+// a different unit, so their state is never taken for this user's. Their
+// units are then held but not wanted, and the next frame drops them.
+const defKey = (w: Want, sub: string) =>
 	JSON.stringify([
 		w.rule,
 		Object.entries(w.params ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+		sub,
 	])
+
+/** The token's subject (the token is the engine's to verify; this only names state). */
+function subOf(token: string): string {
+	try {
+		const payload = JSON.parse(
+			atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/'))
+		) as {
+			sub?: unknown
+		}
+		return typeof payload.sub === 'string' ? payload.sub : ''
+	} catch {
+		return ''
+	}
+}
 
 export class SyncClient {
 	private opts: SyncClientOptions
@@ -186,8 +205,8 @@ export class SyncClient {
 	}
 
 	/** Unit id for a want, stable across connections (one per definition). */
-	private unitId(db: Db, w: Want): number {
-		const key = defKey(w)
+	private unitId(db: Db, w: Want, sub: string): number {
+		const key = defKey(w, sub)
 		const row = db.all('SELECT id FROM _lsync_unit WHERE def = ?', [key])[0]
 		if (row) return Number(row[0])
 		db.exec('INSERT INTO _lsync_unit (def) VALUES (?)', [key])
@@ -196,6 +215,9 @@ export class SyncClient {
 
 	private async sendWant(): Promise<void> {
 		const wantList = this.wants
+		// The token first: its subject names the units (defKey).
+		const token = await this.opts.token()
+		const sub = subOf(token)
 		const { state, wants, have } = await this.enqueue(() =>
 			this.run((db) => {
 				this.applier.ensureSchema(db)
@@ -204,7 +226,7 @@ export class SyncClient {
 						db.all('SELECT k, v FROM _lsync_state').map(([k, v]) => [k as string, v as string])
 					),
 					wants: wantList.map((w) => ({
-						id: this.unitId(db, w),
+						id: this.unitId(db, w, sub),
 						rule: w.rule,
 						params: w.params ?? {},
 					})),
@@ -214,7 +236,6 @@ export class SyncClient {
 				}
 			})
 		)
-		const token = await this.opts.token()
 		const conn = this.conn
 		if (!conn?.open) return
 		conn.send(
