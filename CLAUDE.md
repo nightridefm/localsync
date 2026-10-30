@@ -38,6 +38,7 @@ docker compose up -d && scripts/check-compose.sh   # Postgres 18 + Electric 1.7.
 go test -race ./...                                 # Go unit tests (some need compose)
 go build -o bin/engine ./cmd/engine                 # engine serve | engine plan
 docker build -t localsync-engine .                  # the engine image (apps build it from git)
+bin/engine health [--url http://127.0.0.1:3140/health]  # container healthcheck (the image has no shell)
 pnpm check && pnpm lint                             # TS typecheck + lint
 pnpm --filter @nightride/localsync-harness matrix --adapter=localsync,electric [--only=6] [--write]
 pnpm --filter @nightride/localsync-harness bench [--write]

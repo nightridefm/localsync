@@ -32,6 +32,7 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
 	mux.HandleFunc("/debug/pprof/allocs", pprof.Handler("allocs").ServeHTTP)
+	mux.HandleFunc("/metrics", e.serveMetrics)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
@@ -207,6 +208,10 @@ func (e *Engine) writeLoop(ctx context.Context, c *Client, write func(outMsg) er
 		select {
 		case m := <-c.out:
 			err := write(m)
+			if err == nil {
+				e.m.sentBytes.Add(int64(len(m.data)))
+				e.m.sentMsgs.Add(1)
+			}
 			if c.queued.Add(-int64(len(m.data))) < lowWater && c.pumping.CompareAndSwap(false, true) {
 				// Queue drained: let the engine queue the next parts.
 				e.Do(func() {
@@ -345,7 +350,7 @@ func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = rc.Flush()
 
 	ctx := r.Context()
-	c := &Client{e: e, out: make(chan outMsg, 4096), done: make(chan struct{})}
+	c := &Client{e: e, out: make(chan outMsg, 4096), done: make(chan struct{}), http: true}
 	e.Do(func() { e.addClient(c) })
 	defer e.Do(func() { e.removeClient(c) })
 	p, err := e.verify(m.Token)
@@ -378,4 +383,70 @@ func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	timer := time.NewTimer(limit)
 	defer timer.Stop()
 	e.writeLoop(ctx, c, write, stop, timer.C)
+}
+
+// serveMetrics is the Prometheus text format, without a client library:
+// a handful of gauges read on the engine loop plus monotonic counters.
+func (e *Engine) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	type snap struct {
+		wsClients, httpClients     int
+		units, held, pending       int
+		maxClientLag, head         uint64
+		txns, changes              int64
+		wants, refused             int64
+		snapshotQueries, cacheHits int64
+		commitLag                  float64
+		restarts                   int
+	}
+	done := make(chan snap)
+	e.Do(func() {
+		var s snap
+		for c := range e.clients {
+			if c.http {
+				s.httpClients++
+			} else {
+				s.wsClients++
+			}
+			if c.holds != nil && e.head > c.cursor {
+				s.maxClientLag = max(s.maxClientLag, e.head-c.cursor)
+			}
+		}
+		for _, u := range e.units {
+			s.units++
+			if u.holds > 0 {
+				s.held++
+			}
+			if len(u.pending) > 0 {
+				s.pending++
+			}
+		}
+		s.txns, s.changes = e.m.txns, e.m.changes
+		s.wants, s.refused = e.m.wants, e.m.refused
+		s.snapshotQueries, s.cacheHits = e.m.snapshotQueries, e.m.cacheHits
+		s.commitLag = e.m.commitLag
+		s.restarts, s.head = e.restarts, e.head
+		done <- s
+	})
+	s := <-done
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	metric := func(name, kind, help string, v any) {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %v\n", name, help, name, kind, name, v)
+	}
+	fmt.Fprintf(w, "# HELP localsync_clients Connected clients, by transport.\n# TYPE localsync_clients gauge\n")
+	fmt.Fprintf(w, "localsync_clients{transport=\"websocket\"} %d\nlocalsync_clients{transport=\"http\"} %d\n", s.wsClients, s.httpClients)
+	metric("localsync_units", "gauge", "Units in memory (held or lingering in the resume window).", s.units)
+	metric("localsync_units_held", "gauge", "Units some client holds.", s.held)
+	metric("localsync_units_pending", "gauge", "Units with changes awaiting a restricted query.", s.pending)
+	metric("localsync_client_lag_bytes_max", "gauge", "WAL bytes the furthest-behind client trails the engine's head.", s.maxClientLag)
+	metric("localsync_commit_lag_seconds", "gauge", "Seconds from commit in Postgres to the engine routing it, last transaction.", s.commitLag)
+	metric("localsync_head_lsn", "gauge", "The engine's head: the end of the last transaction routed.", s.head)
+	metric("localsync_transactions_total", "counter", "Transactions routed.", s.txns)
+	metric("localsync_changes_total", "counter", "Row changes routed.", s.changes)
+	metric("localsync_wants_total", "counter", "WANT messages handled (connects, want changes, token refreshes).", s.wants)
+	metric("localsync_wants_refused_total", "counter", "Wants refused (unknown rule, bad parameter, not allowed).", s.refused)
+	metric("localsync_snapshot_queries_total", "counter", "Snapshot queries run to give clients units.", s.snapshotQueries)
+	metric("localsync_snapshot_cache_hits_total", "counter", "Snapshots served from the cache instead.", s.cacheHits)
+	metric("localsync_restarts_total", "counter", "In-process restarts after the replication stream was lost.", s.restarts)
+	metric("localsync_sent_messages_total", "counter", "Protocol messages written to clients.", e.m.sentMsgs.Load())
+	metric("localsync_sent_bytes_total", "counter", "Message bytes written to clients (before transport compression).", e.m.sentBytes.Load())
 }

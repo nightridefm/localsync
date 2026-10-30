@@ -38,8 +38,9 @@ type Change struct {
 
 type Txn struct {
 	Xid       uint32
-	Commit    uint64 // commit LSN
-	End       uint64 // end of the commit record
+	Commit    uint64    // commit LSN
+	End       uint64    // end of the commit record
+	Time      time.Time // commit time (Postgres's clock)
 	Changes   []Change
 	Truncates []*Relation
 }
@@ -183,6 +184,7 @@ func (s *Stream) run(ctx context.Context) {
 				}
 				received = m.TransactionEndLSN
 				cur.End = uint64(m.TransactionEndLSN)
+				cur.Time = m.CommitTime
 				select {
 				case s.Txns <- cur:
 				case <-ctx.Done():

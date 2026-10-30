@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,5 +121,30 @@ func TestWriteLoopDeadlineInsideFrame(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("wrote %q", got)
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	e := loopEngine(t)
+	e.clients = map[*Client]struct{}{{http: true}: {}, {}: {}, {}: {}}
+	e.units = map[string]*Unit{"a": {holds: 1}, "b": {}}
+	e.m.txns, e.m.wants = 7, 3
+	e.m.sentBytes.Add(1024)
+	rec := httptest.NewRecorder()
+	e.serveMetrics(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`localsync_clients{transport="websocket"} 2`,
+		`localsync_clients{transport="http"} 1`,
+		"localsync_units 2\n",
+		"localsync_units_held 1\n",
+		"localsync_transactions_total 7\n",
+		"localsync_wants_total 3\n",
+		"localsync_sent_bytes_total 1024\n",
+		"# TYPE localsync_sent_bytes_total counter\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in\n%s", want, body)
+		}
 	}
 }

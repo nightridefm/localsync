@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,6 +39,17 @@ type Config struct {
 	Window      time.Duration
 	Workers     int
 	Publication string
+}
+
+type metrics struct {
+	txns, changes   int64
+	wants, refused  int64
+	snapshotQueries int64
+	cacheHits       int64
+	// commitLag: seconds from a transaction's commit in Postgres to the
+	// engine routing it, for the last one routed.
+	commitLag           float64
+	sentBytes, sentMsgs atomic.Int64
 }
 
 type stats struct {
@@ -108,8 +120,11 @@ type Engine struct {
 	waiting   []*query // results waiting for the stream to pass lsnS
 	stats     *stats
 	restarts  int // in-process restarts after a lost replication stream
-	fencing   bool
-	fenceAt   time.Time
+	// m is for /metrics: monotonic across in-process restarts (stats is
+	// per epoch). Loop-owned, except the atomics the writers add to.
+	m       metrics
+	fencing bool
+	fenceAt time.Time
 }
 
 func New(ctx context.Context, cfg Config) (*Engine, error) {
@@ -410,6 +425,11 @@ func (e *Engine) rowOf(rel *repl.Relation, t *catalog.Table, vals [][]byte) rule
 }
 
 func (e *Engine) route(t *repl.Txn) {
+	e.m.txns++
+	e.m.changes += int64(len(t.Changes))
+	if !t.Time.IsZero() {
+		e.m.commitLag = time.Since(t.Time).Seconds()
+	}
 	touched := map[*Unit]struct{}{}
 	for _, c := range t.Changes {
 		if c.Rel == nil || c.Rel.Namespace != "public" {
@@ -913,6 +933,7 @@ func (e *Engine) requestSnapshot(h *Hold) {
 		// Warm unit: hand over the cached snapshot; the unit's history after
 		// s.b brings the client to the present. No query.
 		e.stats.cacheHits++
+		e.m.cacheHits++
 		h.setSnapshot(s.b, s.ops, s.sum)
 		u.waiters = slices.DeleteFunc(u.waiters, func(x *Hold) bool { return x == h })
 		return
@@ -926,6 +947,7 @@ func (e *Engine) requestSnapshot(h *Hold) {
 	}
 	u.snapIn = true
 	e.stats.snapshotQueries++
+	e.m.snapshotQueries++
 	e.next = append(e.next, &query{u: u, full: true, forHolds: true})
 }
 

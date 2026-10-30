@@ -534,10 +534,19 @@ optimisation if whole-unit `RESET`s turn out to be common (section 15).
   which carries the old epoch and so reconciles by checksum exactly like
   a reconnect. No new correctness path: catalogue 8b and the simulation's
   `kill walsender` fault cover it.
-- Observability: Prometheus metrics (pipeline lag, routing time per
-  strategy, pending units and pending time, splice retries, query queue,
-  window size, per-client lag), `/debug/pprof`, `/debug/units`, the rule
-  plan.
+- Observability: `/metrics` (Prometheus text, no client library):
+  - Gauges: clients by transport; units, held units and units with
+    pending changes; commit lag (seconds from commit in Postgres to
+    routing, for the last transaction); the furthest-behind client's WAL
+    bytes; the engine's head LSN.
+  - Counters: transactions, row changes, WANTs and refused wants,
+    snapshot queries and cache hits, in-process restarts, messages and
+    bytes sent. Counters stay monotonic across in-process restarts.
+  - Also `/debug/pprof`, `/debug/units` and the rule plan.
+  - All on the engine's own port: put only `/sync` and `/sync/http` behind
+    the public gateway, and scrape the rest privately.
+  - `engine health` checks `/health` for container healthchecks (the image
+    is distroless: no shell, no curl).
 
 ## 9. Wire format
 

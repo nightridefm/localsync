@@ -55,6 +55,8 @@ type Client struct {
 	// grants are the current token's (A22); a WANT for a rule with claims
 	// needs one of them, re-checked on every WANT (token refreshes too).
 	grants []string
+	// http: connected over /sync/http (metrics).
+	http bool
 	// lastSend: when the engine last queued a message; an idle connection
 	// gets a beat so proxies' read timeouts (nginx: 60s) never cut it.
 	lastSend time.Time
@@ -290,6 +292,7 @@ func (e *Engine) release(h *Hold) {
 // want applies a WANT: the full desired set of units plus what the client
 // already has (docs/design.md section 7).
 func (e *Engine) want(c *Client, sub string, m *wantMsg) {
+	e.m.wants++
 	// What the client says it has describes its state only before this
 	// connection's first frame. On a later WANT frames may be in flight
 	// that the client had not applied when it wrote `have` (a removal of
@@ -425,6 +428,7 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 		descs = append(descs, d)
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].ID < descs[j].ID })
+	e.m.refused += int64(len(errs))
 	c.sendJSON(map[string]any{"type": "units", "epoch": e.epoch, "units": descs, "errors": errs})
 }
 

@@ -21,6 +21,8 @@ func main() {
 		err = plan(os.Args[2:])
 	case "serve":
 		err = serve(os.Args[2:])
+	case "health":
+		err = health(os.Args[2:])
 	default:
 		usage()
 	}
@@ -31,6 +33,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: engine (serve|plan) [flags]")
+	fmt.Fprintln(os.Stderr, "usage: engine (serve|plan|health) [flags]")
 	os.Exit(2)
 }
