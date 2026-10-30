@@ -52,6 +52,11 @@ type Analysis struct {
 	// table). An update that changes none of them cannot change any
 	// unit's membership.
 	RefCols map[string][]int
+	// subRows: $sub is in a condition on the rule's own columns (only the
+	// principal's rows); subGate: in any other condition, which shows
+	// every row once it holds. Conservative for review: a condition is
+	// "rows" only when it provably reads the row (Access).
+	subRows, subGate bool
 	// Share, when set, proposes serving the rule from a body shared by
 	// every principal plus per-principal gates (share.go).
 	Share *Share
@@ -99,9 +104,6 @@ func Analyze(rule Rule, cat *catalog.Catalog) (*Analysis, error) {
 		if n != "sub" && !slices.Contains(rule.ClientParams, n) {
 			return nil, reject("parameter $%s is neither $sub nor a declared client parameter", n)
 		}
-	}
-	if len(rule.ClientParams) > 0 && !rule.Public && !slices.Contains(names, "sub") {
-		return nil, reject("client parameters %v are not constrained by any $sub gate (mark the rule public if intended)", rule.ClientParams)
 	}
 	tree, err := pg.Parse(sql)
 	if err != nil {
@@ -172,6 +174,20 @@ func Analyze(rule Rule, cat *catalog.Catalog) (*Analysis, error) {
 	}
 	a.tier()
 	a.share(sel, scope)
+	// Access last, so a malformed rule reports what is wrong with it.
+	sub := slices.Contains(names, "sub")
+	a.subRows, a.subGate = subPlacement(sel.WhereClause, int32(slices.Index(names, "sub")+1))
+	if rule.Public && len(rule.Claims) > 0 {
+		return nil, reject("public and claims together: public means any valid token")
+	}
+	if len(rule.ClientParams) > 0 && !rule.Public && len(rule.Claims) == 0 && !sub {
+		return nil, reject("client parameters %v are not constrained by $sub or claims (mark the rule public if intended)", rule.ClientParams)
+	}
+	if !rule.Public && len(rule.Claims) == 0 && !sub {
+		// Default deny (A22): a rule nobody declared access for would
+		// otherwise be readable by every valid token.
+		return nil, reject("no access declared: reference $sub, require claims, or mark the rule public")
+	}
 	return a, nil
 }
 
@@ -578,6 +594,64 @@ func referencesOutside(n *pg.Node, scope level) bool {
 	return found
 }
 
+// subPlacement classifies the top-level conjuncts that use parameter k
+// ($sub): rows when the conjunct reads the rule's own columns outside any
+// subquery (`user_id = $sub`, `id IN (... $sub ...)`), otherwise gate.
+func subPlacement(where *pg.Node, k int32) (rows, gate bool) {
+	if k == 0 {
+		return false, false
+	}
+	for _, c := range conjuncts(where) {
+		uses := false
+		visit(c, func(m protoreflect.Message) {
+			if p, ok := m.Interface().(*pg.ParamRef); ok && p.Number == k {
+				uses = true
+			}
+		})
+		if !uses {
+			continue
+		}
+		if rowColumn(c) {
+			rows = true
+		} else {
+			gate = true
+		}
+	}
+	return rows, gate
+}
+
+// rowColumn reports a column reference outside subqueries: with one table
+// in FROM, a column of the rule's own row. For `x IN (subquery)` only x.
+func rowColumn(n proto.Message) bool {
+	if n == nil {
+		return false
+	}
+	switch x := n.(type) {
+	case *pg.ColumnRef:
+		return true
+	case *pg.SubLink:
+		return rowColumn(x.Testexpr)
+	}
+	m := n.ProtoReflect()
+	if !m.IsValid() {
+		return false
+	}
+	found := false
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		switch {
+		case fd.IsList() && fd.Message() != nil:
+			l := v.List()
+			for i := 0; i < l.Len() && !found; i++ {
+				found = rowColumn(l.Get(i).Message().Interface())
+			}
+		case fd.Message() != nil && !fd.IsMap():
+			found = rowColumn(v.Message().Interface())
+		}
+		return !found
+	})
+	return found
+}
+
 func hasSubLink(n *pg.Node) bool {
 	found := false
 	visit(n, func(m protoreflect.Message) {
@@ -871,4 +945,25 @@ func operandOf(n *pg.Node, kind catalog.Kind, params []string) (operand, bool) {
 		return operand{}, false
 	}
 	return operand{param: -1, value: v}, true
+}
+
+// Access says who may want the rule (A22): "public", the claims a token
+// must grant, "$sub" (row-scoped or gated per principal), or both.
+func (a *Analysis) Access() string {
+	if a.Rule.Public {
+		return "public"
+	}
+	var parts []string
+	if len(a.Rule.Claims) > 0 {
+		parts = append(parts, "claims: "+strings.Join(a.Rule.Claims, " or "))
+	}
+	switch {
+	case a.subRows && a.subGate:
+		parts = append(parts, "$sub rows + gate")
+	case a.subRows:
+		parts = append(parts, "$sub rows")
+	case a.subGate:
+		parts = append(parts, "$sub gate")
+	}
+	return strings.Join(parts, " + ")
 }

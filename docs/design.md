@@ -127,12 +127,16 @@ One `rules.yaml` per deployment, owned by the app:
 
 ```yaml
 rules:
-  admin/documents: SELECT * FROM document
+  admin/documents:
+    sql: SELECT * FROM document
+    claims: admin
   member/documents: >
     SELECT * FROM document WHERE id IN (
       SELECT document_id FROM document_team WHERE team_id IN (
         SELECT team_id FROM team_member WHERE user_id = $sub))
-  directory/users: SELECT id, name, has_avatar FROM "user"
+  directory/users:
+    sql: SELECT id, name, has_avatar FROM "user"
+    public: true
 
 groups:
   project:
@@ -156,16 +160,26 @@ shapes convert mechanically: `SELECT <columns or *> FROM <table> [WHERE
 
 ### 3.2 Parameters and gates
 
-- `$sub` and `$claims.<name>` come from the token. **Client parameters**
-  (`$project`) come from `WANT`; a rule that uses one must constrain it by
-  a gate referencing `$sub`, or be marked `public: true`, otherwise it
-  fails to load. Gates are ordinary SQL, maintained like any other part of
-  the rule, so revoking a `project_grant` row revokes the units in the
-  same frame.
-- Conjuncts referencing only token values (`'admin' = ANY($claims.roles)`)
-  are checked at `WANT`; false refuses the want with an error, so apps can
-  tell "not allowed" from "empty". Claims are as fresh as the token; for
-  live revocation gate on tables instead (A11).
+- **Every rule declares who may want it** (A22), or fails to load:
+  - `$sub` in its SQL: rows or a gate scoped to the principal.
+  - `claims: [a, b]`: the token's `grants` must include one of them.
+  - Both: `claims` and `$sub`.
+  - `public: true`: any valid token.
+  `engine plan` prints this as the Access column.
+- `$sub` and `grants` come from the token. The app's token endpoint mints
+  it, running the same checks its routes run today, so coarse rights
+  (admin, curator, tenant member) stay in the app's code.
+- **Claims are checked at every `WANT`**, all wants in one pass, in
+  memory. A refused want gets an error (`not allowed`), so apps can tell
+  "not allowed" from "empty". A token refresh is a `WANT`, so a grant
+  missing from the new token drops its units in the next frame. Claims
+  are therefore as fresh as the token: keep it short-lived (minutes), and
+  gate on tables for anything that must revoke at once (A11).
+- **Client parameters** (`$project`) come from `WANT`. A rule that uses
+  one must be constrained by `$sub` or claims, or be marked `public:
+  true`. Gates are ordinary SQL, maintained like any other part of the
+  rule, so revoking a `project_grant` row revokes the units in the same
+  frame.
 - Named parameters are rewritten to `$1..$n` with a lexer-aware pass
   (skipping literals, quoted identifiers, dollar-quoting, comments) before
   parsing with `pg_query_go`; types are inferred from use sites.
@@ -228,8 +242,10 @@ lists (rejected at `WANT`); this avoids per-row column masks entirely.
 
 ### 3.4 Plan output
 
-Startup prints, per rule, the evaluation strategy of each part (section
-4.2), its dependency tables, and which maintained sets it shares.
+Startup prints, per rule, who may want it (Access, section 3.2), the
+evaluation strategy of each part (section 4.2), its dependency tables,
+and which maintained sets it shares. Reviewing access means reading the
+Access column of `engine plan`.
 `engine plan rules.yaml --max-strategy=memory` lets CI fail when a rule
 needs Postgres re-queries for its common changes.
 
@@ -1082,6 +1098,41 @@ Agreed with the user on 2026-10-29, amending the plan where noted.
       fallback anyway.
     - QUIC in Go runs in user space, so it costs more CPU per connection.
   - Revisit if measured mobile reconnects matter.
+
+- **A22. Default-deny rules; grants in the token; per-deployment
+  audience.**
+  - Electric authorises in each app's proxy, per route. localsync has no
+    routes: any valid token can want any rule. So a rule with no
+    declared access would be readable by everyone, and the first corpus
+    conversion did exactly that (an admin route's shape became a rule
+    with no condition).
+  - Every rule now declares access (section 3.2), or the engine refuses
+    to load it.
+  - Coarse rights travel as `grants` in the token, decided by the app's
+    own code, and are checked at every `WANT`.
+  - Data-derived permissions stay SQL gates, which revoke in the same
+    transaction.
+  - The JWT audience is per deployment (`--audience`): App A runs one
+    engine per tenant database, and with a shared secret a token for one
+    tenant must not open another's engine.
+  - Rejected:
+    - **An app proxy in the middle.** Admitting wants there is what
+      claims do, without proxying WebSockets and the HTTP fallback in
+      every app.
+    - **Filtering rows there.** That would mean decoding frames and
+      recomputing checksums, a second sync engine. Shared bodies (A17)
+      already give common buckets with a small per-viewer part.
+  - Catalogue 10c tests the grant, the refusal, and revocation at the
+    next token.
+  - App B's audit (private, with the corpus) turned every one of its 86
+    routes' middleware into rules:
+    - Its roles are table rows, so each became a unit gate, not a claim.
+      All 86 rules load, with the same tiers as before.
+    - Revocation goes from the next long poll (about 20 s) to the same
+      transaction.
+    - `engine plan`'s Access column (`$sub gate`, `$sub rows`, both,
+      claims, public) is the review surface. It calls a condition "rows"
+      only when the condition provably reads the row's own columns.
 
 ## Open questions
 

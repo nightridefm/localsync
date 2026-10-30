@@ -8,6 +8,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { RULES } from '@nightride/localsync-harness/fixture.ts'
+import { yamlRules } from '@nightride/localsync-harness/localsync.ts'
 import { startMiddlebox } from '@nightride/localsync-harness/middlebox.ts'
 import { PG_URL } from '@nightride/localsync-harness/pg.ts'
 
@@ -138,13 +139,7 @@ export async function startStack(rules: string[]): Promise<void> {
 	execFileSync('go', ['build', '-o', 'bin/engine', './cmd/engine'], { cwd: REPO, stdio: 'inherit' })
 	const dir = mkdtempSync(path.join(os.tmpdir(), 'localsync-browser-'))
 	cleanup.push(() => rmSync(dir, { recursive: true, force: true }))
-	const yaml = rules
-		.map((n) => {
-			const r = RULES[n]!
-			return `  ${n}:\n    sql: ${JSON.stringify(r.sql)}${r.params?.length ? `\n    params: ${JSON.stringify(r.params)}` : ''}`
-		})
-		.join('\n')
-	writeFileSync(path.join(dir, 'rules.yaml'), `rules:\n${yaml}\n`)
+	writeFileSync(path.join(dir, 'rules.yaml'), yamlRules(rules.map((n) => RULES[n]!)))
 	const engine = spawn(
 		path.join(REPO, 'bin/engine'),
 		[

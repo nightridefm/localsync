@@ -56,7 +56,7 @@ export const RULES: Record<string, Rule> = Object.fromEntries(
 			['tasks', `SELECT * FROM task WHERE project_id IN (${visibleProjects})`],
 			['comments', `SELECT * FROM comment WHERE task_id IN (${visibleTasks})`],
 			['project_tags', `SELECT * FROM project_tag WHERE project_id IN (${visibleProjects})`],
-			['tags', 'SELECT * FROM tag'],
+			['tags', 'SELECT * FROM tag', undefined, { public: true }],
 			['sink', 'SELECT * FROM kitchen_sink WHERE owner = $sub'],
 			['mutations', 'SELECT * FROM client_mutation WHERE client_id = $sub'],
 			[
@@ -81,8 +81,8 @@ export const RULES: Record<string, Rule> = Object.fromEntries(
 				`SELECT * FROM comment WHERE task_id IN (SELECT id FROM task WHERE project_id = $project AND project_id IN (${visibleProjects}))`,
 				['project'],
 			],
-		] as Array<[string, string, string[]?]>
-	).map(([name, sql, params]) => [name, { name, sql, params }])
+		] as Array<[string, string, string[]?, Partial<Rule>?]>
+	).map(([name, sql, params, extra]) => [name, { name, sql, params, ...extra }])
 )
 
 /** Creates the fixture if missing or outdated. Returns true if (re)created. */

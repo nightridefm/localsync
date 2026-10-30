@@ -3,6 +3,7 @@ package rules
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -28,11 +29,77 @@ const visibleProjects = `SELECT id FROM project WHERE org_id IN (SELECT org_id F
 
 func analyze(t *testing.T, c *catalog.Catalog, sql string, clientParams ...string) *Analysis {
 	t.Helper()
-	a, err := Analyze(Rule{Name: "r", SQL: sql, ClientParams: clientParams}, c)
+	// Rules here test analysis; those with no principal are open on purpose.
+	public := !strings.Contains(sql, "$sub") && len(clientParams) == 0
+	a, err := Analyze(Rule{Name: "r", SQL: sql, Public: public, ClientParams: clientParams}, c)
 	if err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
 	return a
+}
+
+func TestAccess(t *testing.T) {
+	c := fixtureCatalog(t)
+	for _, tc := range []struct {
+		rule   Rule
+		access string // "" = rejected, with err containing why
+		why    string
+	}{
+		{Rule{SQL: `SELECT * FROM tag`}, "", "no access declared"},
+		{Rule{SQL: `SELECT * FROM tag`, Public: true}, "public", ""},
+		{Rule{SQL: `SELECT * FROM tag`, Claims: []string{"admin", "curator"}}, "claims: admin or curator", ""},
+		{Rule{SQL: `SELECT * FROM tag`, Public: true, Claims: []string{"admin"}}, "", "public and claims"},
+		{Rule{SQL: `SELECT * FROM member WHERE user_id = $sub`}, "$sub rows", ""},
+		{Rule{SQL: `SELECT * FROM tag WHERE EXISTS (SELECT 1 FROM member WHERE user_id = $sub)`}, "$sub gate", ""},
+		// Not on the fast path (NOT IN): the gate must still read as one,
+		// never as row scoping.
+		{Rule{SQL: `SELECT * FROM task WHERE id NOT IN (SELECT task_id FROM comment WHERE body = 'x') AND EXISTS (SELECT 1 FROM member WHERE user_id = $sub)`}, "$sub gate", ""},
+		{Rule{SQL: `SELECT * FROM task WHERE project_id IN (SELECT id FROM project WHERE org_id IN (SELECT org_id FROM member WHERE user_id = $sub)) OR title = $sub`}, "$sub rows", ""},
+		{Rule{SQL: `SELECT * FROM member WHERE user_id = $sub AND EXISTS (SELECT 1 FROM member m WHERE m.user_id = $sub AND m.role = 'admin')`}, "$sub rows + gate", ""},
+		{Rule{SQL: `SELECT * FROM member WHERE user_id = $sub`, Claims: []string{"staff"}}, "claims: staff + $sub rows", ""},
+		// An admin may want any project: claims constrain the parameter.
+		{Rule{SQL: `SELECT * FROM task WHERE project_id = $project`, Claims: []string{"admin"}, ClientParams: []string{"project"}}, "claims: admin", ""},
+		{Rule{SQL: `SELECT * FROM task WHERE project_id = $project`, ClientParams: []string{"project"}}, "", "not constrained"},
+	} {
+		tc.rule.Name = "r"
+		a, err := Analyze(tc.rule, c)
+		if tc.access == "" {
+			if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), tc.why) {
+				t.Errorf("%+v: %v (want %q)", tc.rule, err, tc.why)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%+v: %v", tc.rule, err)
+			continue
+		}
+		if a.Access() != tc.access {
+			t.Errorf("%+v: access %q, want %q", tc.rule, a.Access(), tc.access)
+		}
+	}
+}
+
+func TestClaimsYAML(t *testing.T) {
+	rs, err := Parse([]byte(`
+rules:
+  one: {sql: SELECT * FROM tag, claims: admin}
+  many: {sql: SELECT * FROM tag, claims: [admin, curator]}
+groups:
+  g:
+    claims: staff
+    rules:
+      grouped: SELECT * FROM tag
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]string{}
+	for _, r := range rs {
+		got[r.Name] = r.Claims
+	}
+	if !slices.Equal(got["one"], []string{"admin"}) || !slices.Equal(got["many"], []string{"admin", "curator"}) || !slices.Equal(got["grouped"], []string{"staff"}) {
+		t.Fatalf("claims %v", got)
+	}
 }
 
 func occ(a *Analysis, table string) *Occurrence {

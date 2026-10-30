@@ -351,6 +351,33 @@ export const catalogue: Scenario[] = [
 		},
 	},
 	{
+		id: '10c',
+		title: 'authz: rule needing a token claim; dropped from the next token, rows go',
+		async run(ctx) {
+			ctx.addRule({ name: 'staff_tags', sql: 'SELECT * FROM tag', claims: ['staff'] })
+			await ctx.write(async (q) => {
+				for (let i = 0; i < 5; i++)
+					await q('INSERT INTO tag VALUES ($1, $2)', [randomUUID(), `t${i}`])
+			})
+			const staff = { ...ctx.principal('staff'), claims: { grants: ['staff'] } }
+			const other = { ...ctx.principal('other'), claims: { grants: ['curator'] } }
+			const a = await ctx.connect(staff, ['staff_tags'])
+			const b = await ctx.connect(other, ['staff_tags'])
+			await ctx.converge(a)
+			await ctx.converge(b)
+			if (!b.client.errors().some((e) => e.includes('not allowed')))
+				throw new Fail(`no refusal for a token without the claim: ${b.client.errors().join('; ')}`)
+			// A refreshed token without the grant: the next WANT drops the unit.
+			staff.claims.grants = []
+			await a.want([{ rule: 'staff_tags' }])
+			await ctx.converge(a)
+			staff.claims.grants = ['staff']
+			await a.want([{ rule: 'staff_tags' }])
+			await ctx.converge(a)
+			return 'granted: 5 tags; without the claim: refused, 0 rows; revoked at the next token, restored at the one after'
+		},
+	},
+	{
 		id: '10b',
 		title: 'authz: no row outside visibility, even transiently; revocation purges',
 		async run(ctx) {
@@ -512,7 +539,7 @@ export const catalogue: Scenario[] = [
 					`INSERT INTO ${table} VALUES (gen_random_uuid(), 'a'), (gen_random_uuid(), 'b')`
 				)
 				await ctx.refreshCatalog()
-				ctx.addRule({ name: 'probe', sql: `SELECT * FROM ${table}` })
+				ctx.addRule({ name: 'probe', sql: `SELECT * FROM ${table}`, public: true })
 				const c = await ctx.connect(ctx.principal(), ['probe'])
 				await ctx.converge(c)
 				await ctx.write(`ALTER TABLE ${table} ADD COLUMN extra text DEFAULT 'x'`)

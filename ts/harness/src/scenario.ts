@@ -167,8 +167,11 @@ export class Ctx {
 			// client being measured (it shares this event loop).
 			const counts = (await this.countsMatch(conn)) || Date.now() - start > timeoutMs
 			// The engine refused a want (unknown rule, bad parameter): waiting
-			// cannot help, so fail now with the reason.
-			const refused = conn.client.errors().find((e) => /^unit \d+: /.test(e))
+			// cannot help, so fail now with the reason. A refusal for want of
+			// a claim is an access outcome the oracle checks (empty).
+			const refused = conn.client
+				.errors()
+				.find((e) => /^unit \d+: /.test(e) && !e.includes(': not allowed:'))
 			if (refused) throw new Fail(`engine refused a want: ${refused}`)
 			const d = counts
 				? diff(await conn.oracle(), conn.replicaRows())

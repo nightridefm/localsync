@@ -28,9 +28,13 @@ import (
 )
 
 type Config struct {
-	PG          string
-	Rules       []rules.Rule
-	JWTSecret   []byte
+	PG        string
+	Rules     []rules.Rule
+	JWTSecret []byte
+	// Audience the tokens must carry (default "localsync"). Distinct per
+	// deployment when several share a secret (one engine per tenant
+	// database), so a token for one is refused by the others.
+	Audience    string
 	Window      time.Duration
 	Workers     int
 	Publication string
@@ -114,6 +118,9 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	}
 	if cfg.Workers == 0 {
 		cfg.Workers = 4
+	}
+	if cfg.Audience == "" {
+		cfg.Audience = "localsync"
 	}
 	if cfg.Publication == "" {
 		cfg.Publication = "localsync"

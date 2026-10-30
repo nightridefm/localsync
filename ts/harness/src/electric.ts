@@ -78,6 +78,8 @@ class ElectricClient implements Client {
 	async want(bounds: Bound[]): Promise<void> {
 		const tables = new Set<string>()
 		for (const b of bounds) {
+			if (b.rule.claims?.length)
+				throw new Unsupported('token claims: Electric authorises in the app proxy, per route')
 			if (tables.has(b.table))
 				throw new Unsupported(
 					`two rules on table ${b.table}: localdb holds one Electric shape per table`

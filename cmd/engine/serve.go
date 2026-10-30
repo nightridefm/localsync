@@ -23,6 +23,7 @@ func serve(args []string) error {
 	listen := fs.String("listen", ":3140", "listen address")
 	window := fs.Duration("window", 5*time.Minute, "in-memory resume window")
 	workers := fs.Int("workers", 4, "concurrent snapshot queries")
+	audience := fs.String("audience", envOr("LOCALSYNC_JWT_AUDIENCE", "localsync"), "JWT audience; distinct per deployment when deployments share a secret")
 	_ = fs.Parse(args)
 	secret := os.Getenv("LOCALSYNC_JWT_SECRET")
 	if secret == "" {
@@ -34,7 +35,7 @@ func serve(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	e, err := engine.New(ctx, engine.Config{PG: *pgURL, Rules: rs, JWTSecret: []byte(secret), Window: *window, Workers: *workers})
+	e, err := engine.New(ctx, engine.Config{PG: *pgURL, Rules: rs, JWTSecret: []byte(secret), Audience: *audience, Window: *window, Workers: *workers})
 	if err != nil {
 		return err
 	}
@@ -51,4 +52,11 @@ func serve(args []string) error {
 		return nil
 	}
 	return err
+}
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
 }

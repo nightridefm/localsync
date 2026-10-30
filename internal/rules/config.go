@@ -15,11 +15,18 @@ import (
 
 // Rule is one named rule after group expansion. SQL still uses named
 // parameters; Positional turns it into Postgres syntax.
+//
+// Every rule declares who may want it (A22), or fails to load: Public
+// (any valid token), Claims (the token's grants must include one), a
+// $sub reference (row-scoped or gated per principal), or claims and $sub
+// together.
 type Rule struct {
 	Name     string
 	SQL      string
 	Priority int
 	Public   bool
+	// Claims: the token's `grants` must include at least one of these.
+	Claims []string
 	// ClientParams are the parameters the client supplies in WANT.
 	ClientParams []string
 }
@@ -29,14 +36,32 @@ type groupFile struct {
 	Gate     string            `yaml:"gate"`
 	Priority int               `yaml:"priority"`
 	Public   bool              `yaml:"public"`
+	Claims   claimList         `yaml:"claims"`
 	Rules    map[string]string `yaml:"rules"`
 }
 
 type ruleFile struct {
-	SQL      string   `yaml:"sql"`
-	Params   []string `yaml:"params"`
-	Priority int      `yaml:"priority"`
-	Public   bool     `yaml:"public"`
+	SQL      string    `yaml:"sql"`
+	Params   []string  `yaml:"params"`
+	Priority int       `yaml:"priority"`
+	Public   bool      `yaml:"public"`
+	Claims   claimList `yaml:"claims"`
+}
+
+// claimList is `claims: admin` or `claims: [admin, curator]`.
+type claimList []string
+
+func (c *claimList) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		*c = claimList{n.Value}
+		return nil
+	}
+	var l []string
+	if err := n.Decode(&l); err != nil {
+		return err
+	}
+	*c = l
+	return nil
 }
 
 type file struct {
@@ -45,7 +70,7 @@ type file struct {
 }
 
 // Load reads a rules.yaml. Rule values are either a SQL string or a mapping
-// with sql / params / priority / public.
+// with sql / params / priority / public / claims.
 func Load(path string) ([]Rule, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -67,7 +92,7 @@ func Parse(raw []byte) ([]Rule, error) {
 		} else if err := node.Decode(&r); err != nil {
 			return nil, fmt.Errorf("rule %s: %w", name, err)
 		}
-		out = append(out, Rule{Name: name, SQL: strings.TrimSpace(r.SQL), Priority: r.Priority, Public: r.Public, ClientParams: r.Params})
+		out = append(out, Rule{Name: name, SQL: strings.TrimSpace(r.SQL), Priority: r.Priority, Public: r.Public, Claims: r.Claims, ClientParams: r.Params})
 	}
 	for gname, g := range f.Groups {
 		for name, sql := range g.Rules {
@@ -75,7 +100,7 @@ func Parse(raw []byte) ([]Rule, error) {
 			if g.Gate != "" {
 				full = andWhere(full, g.Gate)
 			}
-			out = append(out, Rule{Name: name, SQL: full, Priority: g.Priority, Public: g.Public, ClientParams: g.Params})
+			out = append(out, Rule{Name: name, SQL: full, Priority: g.Priority, Public: g.Public, Claims: g.Claims, ClientParams: g.Params})
 			_ = gname
 		}
 	}

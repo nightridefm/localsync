@@ -84,24 +84,47 @@ func (e *Engine) Handler() http.Handler {
 	return mux
 }
 
-// verify checks an HS256 token and returns its subject and expiry.
-func (e *Engine) verify(token string) (string, time.Time, error) {
+// principal is what a verified token says: who, what it grants (rules
+// with `claims` need one of them, A22) and until when.
+type principal struct {
+	sub    string
+	grants []string
+	exp    time.Time
+}
+
+// verify checks an HS256 token for this deployment's audience.
+func (e *Engine) verify(token string) (principal, error) {
 	claims := jwt.MapClaims{}
 	_, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
 		return e.cfg.JWTSecret, nil
-	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired(), jwt.WithAudience("localsync"))
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired(), jwt.WithAudience(e.cfg.Audience))
 	if err != nil {
-		return "", time.Time{}, err
+		return principal{}, err
 	}
-	sub, _ := claims["sub"].(string)
-	if sub == "" {
-		return "", time.Time{}, errors.New("token has no sub")
+	var p principal
+	p.sub, _ = claims["sub"].(string)
+	if p.sub == "" {
+		return principal{}, errors.New("token has no sub")
 	}
 	exp, err := claims.GetExpirationTime()
 	if err != nil || exp == nil {
-		return "", time.Time{}, errors.New("token has no exp")
+		return principal{}, errors.New("token has no exp")
 	}
-	return sub, exp.Time, nil
+	p.exp = exp.Time
+	switch g := claims["grants"].(type) {
+	case nil:
+	case []any:
+		for _, x := range g {
+			s, ok := x.(string)
+			if !ok {
+				return principal{}, errors.New("token grants must be strings")
+			}
+			p.grants = append(p.grants, s)
+		}
+	default:
+		return principal{}, errors.New("token grants must be a list of strings")
+	}
+	return p, nil
 }
 
 // LOCALSYNC_WS_COMPRESSION=0 turns permessage-deflate off.
@@ -157,7 +180,7 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 			e.Do(func() { c.fail("bad message") })
 			continue
 		}
-		sub, exp, err := e.verify(m.Token)
+		p, err := e.verify(m.Token)
 		if err != nil {
 			slog.Info("auth rejected", "err", err)
 			e.Do(func() { c.fail("auth: " + err.Error()) })
@@ -165,8 +188,8 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 		}
 		e.Do(func() {
 			if !c.closed {
-				c.exp = exp
-				e.want(c, sub, &m)
+				c.exp, c.grants = p.exp, p.grants
+				e.want(c, p.sub, &m)
 			}
 		})
 	}
@@ -325,15 +348,15 @@ func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	c := &Client{e: e, out: make(chan outMsg, 4096), done: make(chan struct{})}
 	e.Do(func() { e.addClient(c) })
 	defer e.Do(func() { e.removeClient(c) })
-	sub, exp, err := e.verify(m.Token)
+	p, err := e.verify(m.Token)
 	if err != nil {
 		slog.Info("auth rejected", "err", err)
 		e.Do(func() { c.fail("auth: " + err.Error()) })
 	} else {
 		e.Do(func() {
 			if !c.closed {
-				c.exp = exp
-				e.want(c, sub, &m)
+				c.exp, c.grants = p.exp, p.grants
+				e.want(c, p.sub, &m)
 			}
 		})
 	}

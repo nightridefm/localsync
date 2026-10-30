@@ -53,14 +53,14 @@ func plan(args []string) error {
 
 	counts := map[string]int{}
 	worst := 0
-	fmt.Println("| Rule | Table | Tier | Strategy | Depends on | Notes |")
-	fmt.Println("| --- | --- | --- | --- | --- | --- |")
+	fmt.Println("| Rule | Table | Access | Tier | Strategy | Depends on | Notes |")
+	fmt.Println("| --- | --- | --- | --- | --- | --- | --- |")
 	for _, r := range rs {
 		a, err := rules.Analyze(r, cat)
 		if err != nil {
 			counts["rejected"]++
 			worst = 4
-			fmt.Printf("| %s | | rejected | | | %s |\n", r.Name, md(err.Error()))
+			fmt.Printf("| %s | | | rejected | | | %s |\n", r.Name, md(err.Error()))
 			continue
 		}
 		counts[fmt.Sprintf("tier %d", a.Tier)]++
@@ -72,7 +72,7 @@ func plan(args []string) error {
 				strategy += " (Phase 4: maintained sets)"
 			}
 		}
-		fmt.Printf("| %s | %s | %d | %s | %s | %s |\n", r.Name, a.Table.Name, a.Tier, strategy, strings.Join(a.Deps, ", "), md(strings.Join(a.Notes, "; ")))
+		fmt.Printf("| %s | %s | %s | %d | %s | %s | %s |\n", r.Name, a.Table.Name, md(a.Access()), a.Tier, strategy, strings.Join(a.Deps, ", "), md(strings.Join(a.Notes, "; ")))
 	}
 	fmt.Printf("\n%d rules: tier 1 %d, tier 2 %d, tier 3 %d, rejected %d\n", len(rs), counts["tier 1"], counts["tier 2"], counts["tier 3"], counts["rejected"])
 	if worst > *maxTier {

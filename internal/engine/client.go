@@ -52,6 +52,9 @@ type Client struct {
 	// exp is the current token's expiry. Past it the client gets nothing
 	// more: it must send a WANT with a fresh token before then.
 	exp time.Time
+	// grants are the current token's (A22); a WANT for a rule with claims
+	// needs one of them, re-checked on every WANT (token refreshes too).
+	grants []string
 	// lastSend: when the engine last queued a message; an idle connection
 	// gets a beat so proxies' read timeouts (nginx: 60s) never cut it.
 	lastSend time.Time
@@ -334,6 +337,12 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 		a, ok := e.analyses[w.Rule]
 		if !ok {
 			errs = append(errs, wantErr{ID: w.ID, Error: "unknown rule " + w.Rule})
+			continue
+		}
+		if len(a.Rule.Claims) > 0 && !slices.ContainsFunc(a.Rule.Claims, func(g string) bool { return slices.Contains(c.grants, g) }) {
+			// Refused, and a hold from an earlier token is dropped below
+			// (not kept), inside the next frame.
+			errs = append(errs, wantErr{ID: w.ID, Error: "not allowed: the token grants none of " + strings.Join(a.Rule.Claims, ", ")})
 			continue
 		}
 		vals := make([]string, len(a.Params))

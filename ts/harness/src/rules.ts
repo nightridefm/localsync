@@ -3,7 +3,17 @@
 // once per (rule, principal, params) into the forms each consumer needs:
 // positional SQL for the oracle, inlined literals for Electric shapes.
 
-export type Rule = { name: string; sql: string; params?: string[] }
+/**
+ * A sync rule. Access (A22): `$sub` in the SQL, `claims` (the token's
+ * grants must include one), or `public`; the engine refuses anything else.
+ */
+export type Rule = {
+	name: string
+	sql: string
+	params?: string[]
+	public?: boolean
+	claims?: string[]
+}
 
 export type Principal = { name: string; sub: string; claims?: Record<string, unknown> }
 
@@ -71,6 +81,9 @@ export function bind(rule: Rule, principal: Principal, want: Want): Bound {
 		if (i < 0) i = order.push(name) - 1
 		return `$${i + 1}`
 	})
+	// A rule with claims shows the principal nothing unless a grant matches.
+	const grants = (principal.claims?.grants as string[] | undefined) ?? []
+	const allowed = !rule.claims?.length || rule.claims.some((c) => grants.includes(c))
 	const cols = m[1]!.trim()
 	const where = m[3] ? substitute(m[3], (name) => literal(value(name))) : null
 	const params = Object.entries(want.params ?? {})
@@ -82,7 +95,7 @@ export function bind(rule: Rule, principal: Principal, want: Want): Bound {
 		params: want.params ?? {},
 		table: m[2]!.replaceAll('"', ''),
 		columns: cols === '*' ? null : cols.split(',').map((c) => c.trim().replaceAll('"', '')),
-		sql,
+		sql: allowed ? sql : `SELECT * FROM (${sql}) denied WHERE false`,
 		values: order.map(value),
 		where,
 	}

@@ -6,30 +6,31 @@ in-memory sqlite-wasm) compared with the oracle (the rule SQL run in Postgres).
 
 | # | Capability | localsync | electric 1.7.9 |
 | --- | --- | --- | --- |
-| 1 | initial snapshot == oracle, all types | pass: 44ms | fail: replica != oracle after 30000ms (1 rows): different kitchen_sink ["8ae2790d-2d2b-4463-8910-2df6f4e22ae1"] {"arr":{"expected":"[\"a\",\"b c\",\"1\",\"NULL\",null,\"q\\\"uote\",\"comma,inside\"]","actual":"[\"a\",\"b c\",\... |
-| 2 | live insert / update / delete | pass: converge ms: 23, 2, 2, 3 | pass: converge ms: 22, 1, 22, 3 |
-| 3 | snapshot under concurrent writes: no dupes / gaps | pass: 674 concurrent txns, converged in 51ms | pass: 904 concurrent txns, converged in 19ms |
-| 4 | row enters / leaves scope via its own column | pass: in 22ms, out 1ms | pass: in 21ms, out 21ms |
-| 5 | visibility gained / revoked via related-table write (multi-hop) | pass: gain 26ms, revoke 17ms | pass: gain 66ms, revoke 6ms |
-| 6 | never observe a partial transaction | pass: 159 local commits, none torn | fail: 161 of 278 local commits showed a torn task/comment pair |
+| 1 | initial snapshot == oracle, all types | pass: 45ms | fail: replica != oracle after 30000ms (1 rows): different kitchen_sink ["a3145db9-28a6-427d-bfdd-0cf3f9fd5b84"] {"arr":{"expected":"[\"a\",\"b c\",\"1\",\"NULL\",null,\"q\\\"uote\",\"comma,inside\"]","actual":"[\"a\",\"b c\",\... |
+| 2 | live insert / update / delete | pass: converge ms: 23, 2, 1, 2 | pass: converge ms: 23, 3, 24, 2 |
+| 3 | snapshot under concurrent writes: no dupes / gaps | pass: 659 concurrent txns, converged in 50ms | fail: replica != oracle after 30000ms (2 rows): different task ["b16fdd5c-5a5c-4afd-9e54-fd94f59b7e34"] {"title":{"expected":"touched 68","actual":"task 69"}} |
+| 4 | row enters / leaves scope via its own column | pass: in 21ms, out 1ms | pass: in 21ms, out 22ms |
+| 5 | visibility gained / revoked via related-table write (multi-hop) | pass: gain 26ms, revoke 17ms | pass: gain 67ms, revoke 7ms |
+| 6 | never observe a partial transaction | pass: 159 local commits, none torn | fail: 152 of 269 local commits showed a torn task/comment pair |
 | 7 | resume after disconnect without full re-snapshot | pass: initial 91206 B, resume 352 B | pass: initial 719053 B, resume 509 B |
-| 8 | server restart: converge, no loss | pass: converged 74ms after restart, 9467 B re-sent | pass: converged 578ms after restart, 7660 B re-sent |
-| 8b | replication connection lost: converge, no loss | pass: converged 159ms after the walsender was killed, 9737 B re-sent | pass: converged 28ms after the walsender was killed, 8712 B re-sent |
-| 9 | client beyond retention still converges | pass: 26ms | pass: 66ms |
+| 8 | server restart: converge, no loss | pass: converged 263ms after restart, 9474 B re-sent | pass: converged 576ms after restart, 7660 B re-sent |
+| 8b | replication connection lost: converge, no loss | pass: converged 160ms after the walsender was killed, 9792 B re-sent | pass: converged 29ms after the walsender was killed, 8268 B re-sent |
+| 9 | client beyond retention still converges | pass: 25ms | pass: 66ms |
 | 10a | authz: forged / expired token rejected | pass: forged, expired and wrong-audience tokens rejected; served connections stop at token expiry | unsupported: no client auth in the engine; the app proxy authorises requests |
+| 10c | authz: rule needing a token claim; dropped from the next token, rows go | pass: granted: 5 tags; without the claim: refused, 0 rows; revoked at the next token, restored at the one after | unsupported: token claims: Electric authorises in the app proxy, per route |
 | 10b | authz: no row outside visibility, even transiently; revocation purges | pass: no leaked row states, revocations purged | pass: no leaked row states, revocations purged |
-| 11 | updates leave unchanged TOAST columns intact | pass: 1ms | pass: 21ms |
-| 11b | out-of-line TOAST (incompressible) kept on updates of other columns | pass: 1ms (stored 40000 B, compressed f) | pass: 21ms (stored 40000 B, compressed f) |
-| 11c | REPLICA IDENTITY DEFAULT: unsent TOAST, entering rows, key-only deletes | pass: 2ms, identity left at DEFAULT | pass: 21ms, identity left at f |
+| 11 | updates leave unchanged TOAST columns intact | pass: 0ms | pass: 22ms |
+| 11b | out-of-line TOAST (incompressible) kept on updates of other columns | pass: 1ms (stored 40000 B, compressed f) | pass: 22ms (stored 40000 B, compressed f) |
+| 11c | REPLICA IDENTITY DEFAULT: unsent TOAST, entering rows, key-only deletes | pass: 1ms, identity left at DEFAULT | pass: 21ms, identity left at f |
 | 12a | TRUNCATE | pass: 0ms | pass: 21ms |
-| 12b | column added upstream: sync continues on known columns | pass: 0ms | fail: replica != oracle after 30000ms (3 rows): missing ddl_probe_41c43c39 ["f1cd3359-f2bf-4b69-b94a-2e64201c74ab"] {"id":"f1cd3359-f2bf-4b69-b94a-2e64201c74ab","label":"b"} |
+| 12b | column added upstream: sync continues on known columns | pass: 0ms | fail: replica != oracle after 30000ms (3 rows): missing ddl_probe_fe7715c3 ["c32a2cb5-d26b-410e-b4c8-36f6d9b0709c"] {"id":"c32a2cb5-d26b-410e-b4c8-36f6d9b0709c","label":"b"} |
 | 13 | read-your-writes: client can tell when a write is reflected | pass: confirmed with its data; p50 0ms; unrelated write confirmed | fail: 20 local commits showed a mutation confirmed before its data arrived |
-| 14 | 100k-row transaction | pass: 2358ms, atomic | fail: converged in 86587ms but showed 3 partial states (e.g. 25492, 50941, 76331 rows) |
-| 15 | subscribe / unsubscribe mid-session, atomically | pass: swapped in 30ms in 1 commit(s) | fail: 4 of 6 local commits during the swap showed neither project fully |
+| 14 | 100k-row transaction | pass: 2303ms, atomic | fail: timed out after 300000ms |
+| 15 | subscribe / unsubscribe mid-session, atomically | pass: swapped in 31ms in 1 commit(s) | fail: 4 of 6 local commits during the swap showed neither project fully |
 | 15b | want swapped away and back before the first swap lands | pass: project A intact after 5 swaps away and straight back | unsupported: two rules on table task: localdb holds one Electric shape per table |
-| 17 | rule dropped while offline: its rows go on reconnect | pass: 3ms | pass: 22ms |
+| 17 | rule dropped while offline: its rows go on reconnect | pass: 2ms | pass: 22ms |
 | 16 | two rules on one table (multi-role union) | pass: 24ms | unsupported: two rules on table task: localdb holds one Electric shape per table |
-| 18 | project-scoped rule with a permission gate: grant and revoke per viewer | pass: alice 0 tasks, bob 99, carol 99; no row outside visibility | fail: replica != oracle after 30000ms (200 rows): missing task ["17cddf59-4288-46e8-bd40-aa292f962aa1"] {"id":"17cddf59-4288-46e8-bd40-aa292f962aa1","project_id":"d9e2da35-2529-4fde-a906-c060f9b259c9","title":"task 1","done":"... |
+| 18 | project-scoped rule with a permission gate: grant and revoke per viewer | pass: alice 0 tasks, bob 99, carol 99; no row outside visibility | fail: replica != oracle after 30000ms (200 rows): missing task ["7abbe8c3-7f81-47a6-b658-3df29d4c99a6"] {"id":"7abbe8c3-7f81-47a6-b658-3df29d4c99a6","project_id":"4fc6fc2e-bfaa-461e-ab6f-eab647e53bb4","title":"task 1","done":"... |
 
 ## Notes
 

@@ -49,11 +49,13 @@ const b64url = (b: Buffer | string) => Buffer.from(b).toString('base64url')
 
 export function mintToken(
 	sub: string,
-	opts: { secret?: string; expSeconds?: number; aud?: string } = {}
+	opts: { secret?: string; expSeconds?: number; aud?: string; grants?: string[] } = {}
 ): string {
 	const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
 	const exp = Math.floor(Date.now() / 1000) + (opts.expSeconds ?? 600)
-	const payload = b64url(JSON.stringify({ sub, exp, aud: opts.aud ?? 'localsync' }))
+	const payload = b64url(
+		JSON.stringify({ sub, exp, aud: opts.aud ?? 'localsync', grants: opts.grants })
+	)
 	const sig = createHmac('sha256', opts.secret ?? SECRET)
 		.update(`${header}.${payload}`)
 		.digest('base64url')
@@ -72,12 +74,15 @@ function wrap(db: SqliteDb): SyncDb {
 	}
 }
 
-function yamlRules(rules: Map<string, Rule>): string {
+/** rules.yaml for the engine (also used by the browser tests). */
+export function yamlRules(rules: Iterable<Rule>): string {
 	const lines = ['rules:']
-	for (const r of rules.values()) {
+	for (const r of rules) {
 		lines.push(`  ${JSON.stringify(r.name)}:`)
 		lines.push(`    sql: ${JSON.stringify(r.sql)}`)
 		if (r.params?.length) lines.push(`    params: ${JSON.stringify(r.params)}`)
+		if (r.public) lines.push('    public: true')
+		if (r.claims?.length) lines.push(`    claims: ${JSON.stringify(r.claims)}`)
 	}
 	return `${lines.join('\n')}\n`
 }
@@ -98,7 +103,8 @@ export class LocalsyncClient implements Client {
 	private received = 0
 	private bounds: Bound[]
 
-	constructor(replica: Replica, sub: string, bounds: Bound[], conn: ConnOptions) {
+	constructor(replica: Replica, principal: Principal, bounds: Bound[], conn: ConnOptions) {
+		const sub = principal.sub
 		this.replica = replica
 		this.bounds = bounds
 		this.sync = new SyncClient({
@@ -106,7 +112,9 @@ export class LocalsyncClient implements Client {
 			url: conn.url ?? URL_,
 			httpUrl: conn.httpUrl ?? HTTP_URL,
 			transport: conn.transport ?? TRANSPORT,
-			token: () => mintToken(sub),
+			// Read at every mint: a scenario may change the grants, which the
+			// engine checks at the next WANT (a token refresh).
+			token: () => mintToken(sub, { grants: principal.claims?.grants as string[] | undefined }),
 			db: wrap(replica.db),
 			onCommit: () => {
 				for (const l of this.listeners) l()
@@ -212,7 +220,7 @@ export class LocalsyncAdapter implements Adapter {
 				`port ${PORT} already has an engine (stale process?); kill it or set LOCALSYNC_ENGINE_PORT`
 			)
 		const rulesPath = path.join(this.dir, 'rules.yaml')
-		writeFileSync(rulesPath, yamlRules(this.rules))
+		writeFileSync(rulesPath, yamlRules(this.rules.values()))
 		const proc = spawn(
 			path.join(REPO, 'bin/engine'),
 			['serve', '--pg', PG_URL, '--rules', rulesPath, '--listen', `127.0.0.1:${PORT}`],
@@ -273,7 +281,7 @@ export class LocalsyncAdapter implements Adapter {
 			await this.stop()
 			await this.start()
 		}
-		const c = new LocalsyncClient(await Replica.open(catalog), principal.sub, bounds, this.conn)
+		const c = new LocalsyncClient(await Replica.open(catalog), principal, bounds, this.conn)
 		this.clients.add(c)
 		return c
 	}
