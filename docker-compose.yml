@@ -75,6 +75,10 @@ services:
     network_mode: host
     environment:
       LOCALSYNC_TLS_DOMAIN: ${LOCALSYNC_TLS_DOMAIN:-localhost}
+    # Only our template renders into conf.d: the image's default server
+    # would otherwise listen on host port 80 (an app's nginx needs it).
+    tmpfs:
+      - /etc/nginx/conf.d
     volumes:
       - ./docker/gateway/templates:/etc/nginx/templates:ro
       - ./docker/gateway/snippets:/etc/nginx/snippets:ro
