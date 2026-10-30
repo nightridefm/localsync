@@ -93,8 +93,11 @@ export class Applier {
 		check = true
 	): void {
 		if (!this.current.has(u.id)) {
-			// Removal of a unit no longer wanted.
-			db.exec('DELETE FROM _lsync_unit WHERE id = ?', [u.id])
+			// Removal of a unit no longer wanted. The row stays (not held):
+			// it is the definition's id, and a WANT already sent may want the
+			// unit back under it; deleted, that unit's checksum would never
+			// be stored again and its next delta would read as drift.
+			db.exec(`UPDATE _lsync_unit SET held = 0, checksum = '0', drift = 0 WHERE id = ?`, [u.id])
 			return
 		}
 		if (!check) {
@@ -195,7 +198,8 @@ export class Applier {
 				for (const [pk] of db.all('SELECT pk FROM _lsync_member WHERE unit = ?', [id]))
 					orphan({ table: tbl as string }, pk as string, JSON.parse(pk as string) as SqlValue[])
 				db.exec('DELETE FROM _lsync_member WHERE unit = ?', [id])
-				db.exec('DELETE FROM _lsync_unit WHERE id = ?', [id])
+				// Not held; the row keeps the definition's id (see finishUnit).
+				db.exec(`UPDATE _lsync_unit SET held = 0, checksum = '0', drift = 0 WHERE id = ?`, [id])
 				tables.add(tbl as string)
 			}
 			for (const f of frame.fragments) {

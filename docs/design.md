@@ -422,6 +422,17 @@ answers per unit:
 | unit not held | `RESET` + rows |
 | unit held but not in the wants | nothing from the engine; the client drops it inside the next frame's transaction (the engine forces one) |
 
+Haves count only on a connection's first `WANT`. Later `WANT`s on the
+same connection (a project switch, a token refresh) keep the holds they
+share with the last one untouched, and a hold that is new gets `RESET` +
+rows whatever the client says it has. The client writes its haves from
+what it has applied, and the engine may already have sent frames it has
+not: switching away from a project and straight back sends a removal of
+the project's units and then a `WANT` that still lists them as held
+(catalogue 15b). Over
+HTTP every `WANT` is a new connection (section 9.1), so haves always
+count there.
+
 **Checksums.** A column hash is a 64-bit FNV pair over (column index,
 canonical wire bytes of the value), so client and engine hash identical
 bytes; a row hash is the sum of its column hashes (so `PATCH` can carry
@@ -793,7 +804,8 @@ over `wss://` and `https://` exactly as browsers reach the apps.
 
 - **Harness and simulation**: `LOCALSYNC_URL` and `LOCALSYNC_TRANSPORT`
   route every client through it. The catalogue passes 23/23 over WSS
-  through nginx, and 23/23 over HTTP streaming and over long polls.
+  through nginx, and 23/23 over HTTP streaming and over long polls
+  (before catalogue 15b was added).
   20/20 fault-simulation seeds pass over HTTP.
 - **`pnpm ... gateway`** checks four cases, each with a load of 2,000
   tasks and comments, 75 s idle, then timed updates:
@@ -919,6 +931,18 @@ each found by building or by the harness:
   now forbids Node globals in `ts/transport/src`.
 - **Waiting clients already share one snapshot query**, so a cache only
   helps clients that arrive after the query finished (section 8).
+- **Switching away from a project and straight back** hid two bugs:
+  - **Engine** (section 7): a `WANT` resumed units on the strength of
+    haves the client wrote before applying a frame that removed them.
+    The client ended up with an empty unit the engine believed full,
+    found while chasing the next bug and made deterministic as
+    catalogue 15b. Haves now count only on a connection's first `WANT`.
+  - **Client**: a removal deleted the unit's `_lsync_unit` row, which is
+    also the definition's id. The `WANT` that wanted the unit back was
+    already sent under that id, so the unit's checksum was never stored
+    again, and its next delta read as drift. The smash simulation found
+    it (seed 213, only under four parallel jobs). Removals now mark the
+    unit not held (`apply.test.ts` replays the ordering).
 - **nginx closes idle WebSockets at 60 s** (`proxy_read_timeout`), which
   is the default on most routes an app would mount the engine on. Hence
   the `BEAT` messages (section 9.1).

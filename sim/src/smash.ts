@@ -47,6 +47,7 @@ const chance = (p: number) => rand() < p
 
 const log: string[] = []
 const note = (s: string) => log.push(s)
+const short = (id: string) => id.slice(0, 8)
 
 const db = new Db()
 let adapter: Adapter
@@ -77,6 +78,7 @@ await ctx.write(async (q) => {
 const projectOrg = new Map<string, string>()
 for (const [i, p] of world.projects.entries()) projectOrg.set(p, world.orgs[Math.floor(i / 3)]!)
 const pairs: Array<{ task: string; comment: string }> = []
+for (const [p, org] of projectOrg) note(`project ${short(p)} in org ${short(org)}`)
 
 function wantsFor(i: number, project: string | null) {
 	const base: Array<string | { rule: string; params: Record<string, string> }> = [
@@ -101,6 +103,7 @@ for (const [i, p] of principals.entries()) {
 	const conn = await ctx.connect(p, wantsFor(i, project))
 	await conn.trackVisibility()
 	const sim: Sim = { conn, torn: 0, commits: 0, online: true, project }
+	note(`p${i} project ${project ? short(project) : '-'}`)
 	conn.client.onCommit(() => {
 		sim.commits++
 		const r = conn.client.replica.db
@@ -153,6 +156,7 @@ const ops: Array<[number, string, () => Promise<void>]> = [
 				await q(`INSERT INTO comment VALUES ($1, $2, 'pair', $3)`, [comment, task, tag])
 			})
 			pairs.push({ task, comment })
+			note(`  project ${short(project)} task ${short(task)}`)
 		},
 	],
 	[
@@ -203,10 +207,16 @@ const ops: Array<[number, string, () => Promise<void>]> = [
 		8,
 		'revoke membership',
 		async () => {
-			await ctx.write(
-				`DELETE FROM member WHERE id = (SELECT id FROM member WHERE user_id = $1 ORDER BY random() LIMIT 1)`,
-				[pick(principals).sub]
-			)
+			const p = pick(principals)
+			let org = '-'
+			await ctx.write(async (q) => {
+				const [r] = await q(
+					`DELETE FROM member WHERE id = (SELECT id FROM member WHERE user_id = $1 ORDER BY random() LIMIT 1) RETURNING org_id`,
+					[p.sub]
+				)
+				if (r) org = short(String(r.org_id))
+			})
+			note(`  p${principals.indexOf(p)} org ${org}`)
 		},
 	],
 	[
@@ -237,6 +247,7 @@ const ops: Array<[number, string, () => Promise<void>]> = [
 			const s = sims[i]!
 			if (!s.online) return
 			s.project = chance(0.2) ? null : pick(world.projects)
+			note(`  p${i} project ${s.project ? short(s.project) : '-'}`)
 			await s.conn.want(
 				wantsFor(i, s.project).map((w) => (typeof w === 'string' ? { rule: w } : w))
 			)
@@ -247,6 +258,7 @@ const ops: Array<[number, string, () => Promise<void>]> = [
 		'disconnect / reconnect',
 		async () => {
 			const s = pick(sims)
+			note(`  p${sims.indexOf(s)} ${s.online ? 'offline' : 'online'}`)
 			if (s.online) await s.conn.client.disconnect()
 			else await s.conn.client.reconnect()
 			s.online = !s.online
@@ -286,6 +298,7 @@ try {
 		if (step % checkpointEvery === 0 || step === steps) {
 			for (const s of sims) {
 				if (!s.online) {
+					note(`  checkpoint: p${sims.indexOf(s)} online`)
 					await s.conn.client.reconnect()
 					s.online = true
 				}

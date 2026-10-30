@@ -661,6 +661,40 @@ export const catalogue: Scenario[] = [
 		},
 	},
 	{
+		id: '15b',
+		title: 'want swapped away and back before the first swap lands',
+		async run(ctx) {
+			const p = ctx.principal()
+			let w!: Awaited<ReturnType<typeof seedWorld>>
+			await ctx.write(async (q) => {
+				w = await seedWorld(q, {
+					orgs: 1,
+					projects: 2,
+					tasks: 300,
+					comments: 1,
+					memberOf: [[p.sub]],
+				})
+			})
+			const [a, b] = w.projects as [string, string]
+			const wants = (project: string) => [
+				{ rule: 'project_tasks', params: { project } },
+				{ rule: 'project_comments', params: { project } },
+				{ rule: 'shared_tasks', params: { project } },
+			]
+			const c = await ctx.connect(p, wants(a))
+			await ctx.converge(c)
+			// B needs a snapshot, so the first swap is still in flight when
+			// the second (back to A, which the client still holds) arrives.
+			for (let i = 0; i < 5; i++) {
+				const away = c.want(wants(b))
+				await c.want(wants(a))
+				await away
+				await ctx.converge(c)
+			}
+			return 'project A intact after 5 swaps away and straight back'
+		},
+	},
+	{
 		id: '17',
 		title: 'rule dropped while offline: its rows go on reconnect',
 		async run(ctx) {
@@ -739,9 +773,10 @@ export const catalogue: Scenario[] = [
 			]
 			for (const c of conns) await c.trackVisibility()
 			for (const c of conns) await ctx.converge(c)
-			await ctx.write(`UPDATE task SET title = 'live' WHERE project_id = $1 AND title LIKE 'task 1%'`, [
-				project,
-			])
+			await ctx.write(
+				`UPDATE task SET title = 'live' WHERE project_id = $1 AND title LIKE 'task 1%'`,
+				[project]
+			)
 			await ctx.write(`UPDATE task SET project_id = $2 WHERE id = $1`, [w.tasks[0], w.projects[1]])
 			for (const c of conns) await ctx.converge(c)
 			// Bob gains the project, then Alice loses it, each in one write.
@@ -750,12 +785,14 @@ export const catalogue: Scenario[] = [
 				bob.sub,
 			])
 			await ctx.write(`DELETE FROM member WHERE user_id = $1`, [alice.sub])
-			await ctx.write(`UPDATE task SET title = 'after' WHERE project_id = $1 AND title LIKE 'task 2%'`, [
-				project,
-			])
+			await ctx.write(
+				`UPDATE task SET title = 'after' WHERE project_id = $1 AND title LIKE 'task 2%'`,
+				[project]
+			)
 			for (const c of conns) await ctx.converge(c)
 			for (const c of conns) c.verifyNoLeaks()
-			const n = (c: (typeof conns)[number]) => c.client.replica.db.selectValue('SELECT count(*) FROM task')
+			const n = (c: (typeof conns)[number]) =>
+				c.client.replica.db.selectValue('SELECT count(*) FROM task')
 			return `alice ${n(conns[0]!)} tasks, bob ${n(conns[1]!)}, carol ${n(conns[2]!)}; no row outside visibility`
 		},
 	},

@@ -20,6 +20,9 @@ const REPO = path.resolve(import.meta.dirname, '../../..')
 const SECRET = 'harness-secret'
 const PORT = Number(process.env.LOCALSYNC_ENGINE_PORT ?? 3141)
 const DEBUG = !!process.env.HARNESS_DEBUG
+// LOCALSYNC_DRIFT_DUMP=1: dump client and engine members on drift, without
+// the debug logging (which changes timing enough to hide some races).
+const DRIFT_DUMP = DEBUG || !!process.env.LOCALSYNC_DRIFT_DUMP
 // Clients may reach the engine through a gateway (docker/gateway):
 // LOCALSYNC_URL is the ws(s):// /sync URL (default: the engine directly),
 // LOCALSYNC_HTTP_URL the /sync/http one, LOCALSYNC_TRANSPORT websocket
@@ -113,7 +116,7 @@ export class LocalsyncClient implements Client {
 			},
 			onError: (m) => {
 				if (DEBUG) console.error(`[localsync] ${m}`)
-				if (DEBUG && m.includes('drift')) void this.dumpDrift(sub)
+				if (DRIFT_DUMP && m.includes('drift')) void this.dumpDrift(sub)
 			},
 		})
 		this.sync.start(this.wantsOf(bounds))

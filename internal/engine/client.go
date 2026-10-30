@@ -287,7 +287,13 @@ func (e *Engine) release(h *Hold) {
 // want applies a WANT: the full desired set of units plus what the client
 // already has (docs/design.md section 7).
 func (e *Engine) want(c *Client, sub string, m *wantMsg) {
-	if c.holds == nil {
+	// What the client says it has describes its state only before this
+	// connection's first frame. On a later WANT frames may be in flight
+	// that the client had not applied when it wrote `have` (a removal of
+	// the very unit it now wants back, say), so a new hold then always
+	// gets the unit whole; holds that are kept need nothing.
+	first := c.holds == nil
+	if first {
 		c.holds = map[uint32]*Hold{}
 		if m.Have.Epoch == e.epoch {
 			c.cursor, _ = strconv.ParseUint(m.Have.Cursor, 10, 64)
@@ -374,7 +380,9 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 			h.u = e.holdUnit(a, sub, w.Params)
 		}
 		u := h.u
-		h.haveSum, h.haveOK = have[w.ID]
+		if first {
+			h.haveSum, h.haveOK = have[w.ID]
+		}
 		c.holds[w.ID] = h
 		keep[w.ID] = true
 		if sameEpoch && h.haveOK && u.state == ready && c.cursor >= u.histFrom && gatesCover(h, c.cursor) {
