@@ -1,0 +1,39 @@
+# A version tag (v0.1.0) releases both halves of the protocol at once: apps
+# build the engine from the tag (LOCALSYNC_REF=v0.1.0) and install the client
+# from the tarball attached here:
+#   https://github.com/nightridefm/localsync/releases/download/v0.1.0/nightride-localsync-0.1.0.tgz
+# The tag must match ts/transport/package.json's version (bump it first).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  transport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26.13.0
+          cache: pnpm
+      - name: tag matches version
+        run: |
+          v=$(node -p "require('./ts/transport/package.json').version")
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != ts/transport version $v"; exit 1; }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm lint
+      - run: pnpm --filter @nightride/localsync test
+      - name: pack
+        working-directory: ts/transport
+        run: pnpm build && pnpm pack
+      - name: release
+        run: gh release create "$GITHUB_REF_NAME" ts/transport/*.tgz --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

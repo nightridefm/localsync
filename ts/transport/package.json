@@ -1,6 +1,6 @@
 {
 	"name": "@nightride/localsync",
-	"version": "0.0.0",
+	"version": "0.1.0",
 	"description": "localdb SyncTransport for the localsync engine",
 	"license": "MIT",
 	"repository": {
@@ -8,12 +8,26 @@
 		"url": "git+https://github.com/nightridefm/localsync.git",
 		"directory": "ts/transport"
 	},
+	"files": [
+		"dist",
+		"src",
+		"!src/**/*.test.ts"
+	],
 	"type": "module",
 	"exports": {
 		".": "./src/index.ts"
 	},
+	"publishConfig": {
+		"exports": {
+			".": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			}
+		}
+	},
 	"scripts": {
 		"check": "tsc -p tsconfig.json",
-		"test": "node --test src/*.test.ts"
+		"test": "node --test src/*.test.ts",
+		"build": "node scripts/build-dist.mjs"
 	}
 }
