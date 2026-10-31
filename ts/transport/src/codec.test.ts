@@ -14,12 +14,12 @@ const golden = JSON.parse(
 	)
 ) as { kinds: Kind[]; rows: Array<{ hex: string; hash: string; member: string }> }
 
-test('row hash matches the Go engine', () => {
+void test('row hash matches the Go engine', () => {
 	const cols: ColumnDesc[] = golden.kinds.map((kind, i) => ({ name: `c${i}`, kind }))
 	for (const r of golden.rows)
 		assert.equal(rowHash(cols, Buffer.from(r.hex, 'hex')).toString(), r.hash)
 })
 
-test('member hash matches the Go engine', () => {
+void test('member hash matches the Go engine', () => {
 	for (const r of golden.rows) assert.equal(memberHash(BigInt(r.hash)).toString(), r.member)
 })
