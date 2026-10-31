@@ -32,10 +32,10 @@ type Analysis struct {
 	Fast bool
 	Pred Expr
 	// Gates are row-independent conjuncts (uncorrelated EXISTS / NOT
-	// EXISTS), each as a standalone query `SELECT 1 WHERE <gate>` over the
-	// unit's parameters. A fast rule's unit is empty unless all gates hold;
-	// changes to a gate's tables re-evaluate the unit (Full occurrences).
-	Gates []string
+	// EXISTS), each a standalone query `SELECT 1 WHERE <gate>`. A fast
+	// rule's unit is empty unless all gates hold; changes to a gate's
+	// tables re-evaluate the unit (Full occurrences).
+	Gates []Gate
 	// OwnNarrow are top-level AND conjuncts of the rule's own table that
 	// the engine can evaluate: a change for which one is not TRUE on either
 	// the old or the new row cannot affect the unit.
@@ -217,9 +217,27 @@ func (a *Analysis) refCols(where *pg.Node, cat *catalog.Catalog) {
 	}
 }
 
+// Gate is a standalone gate query. It is numbered on its own: SQL's $i+1
+// is the rule's parameter Args[i], so it binds only the parameters it
+// reads (a gate reading $sub alone, in a rule that also has $project).
+type Gate struct {
+	SQL  string
+	Args []int
+}
+
+// GateArgs are the values of g's parameters, given the unit's values for
+// every parameter of the rule.
+func (g Gate) GateArgs(params []string) []string {
+	vals := make([]string, len(g.Args))
+	for i, j := range g.Args {
+		vals[i] = params[j]
+	}
+	return vals
+}
+
 // gated splits a WHERE into a compilable row predicate and uncorrelated
 // EXISTS gates. ok is false unless every conjunct is one or the other.
-func (a *Analysis) gated(where *pg.Node, scope level, cat *catalog.Catalog) (Expr, []string, bool) {
+func (a *Analysis) gated(where *pg.Node, scope level, cat *catalog.Catalog) (Expr, []Gate, bool) {
 	var local []Expr
 	var gates []*pg.Node
 	for _, c := range conjuncts(where) {
@@ -239,7 +257,7 @@ func (a *Analysis) gated(where *pg.Node, scope level, cat *catalog.Catalog) (Exp
 	if len(gates) == 0 {
 		return nil, nil, false
 	}
-	var sqls []string
+	var out []Gate
 	for _, g := range gates {
 		q, err := pg.Deparse(&pg.ParseResult{Version: a.pgVersion, Stmts: []*pg.RawStmt{{Stmt: &pg.Node{Node: &pg.Node_SelectStmt{SelectStmt: &pg.SelectStmt{
 			TargetList:  []*pg.Node{{Node: &pg.Node_ResTarget{ResTarget: &pg.ResTarget{Val: &pg.Node{Node: &pg.Node_AConst{AConst: &pg.A_Const{Val: &pg.A_Const_Ival{Ival: &pg.Integer{Ival: 1}}}}}}}}},
@@ -248,14 +266,25 @@ func (a *Analysis) gated(where *pg.Node, scope level, cat *catalog.Catalog) (Exp
 		if err != nil {
 			return nil, nil, false
 		}
-		sqls = append(sqls, q)
+		// Deparsed with the rule's numbering; renumber over the
+		// parameters this gate reads.
+		named, ok := Named(q, a.Params)
+		if !ok {
+			return nil, nil, false
+		}
+		sql, names := Positional(named)
+		gate := Gate{SQL: sql, Args: make([]int, len(names))}
+		for i, n := range names {
+			gate.Args[i] = slices.Index(a.Params, n)
+		}
+		out = append(out, gate)
 		a.walk(g, scope, nil, "", false, cat)
 	}
 	var pred Expr
 	if len(local) > 0 {
 		pred = andExpr(local)
 	}
-	return pred, sqls, true
+	return pred, out, true
 }
 
 // isGate: EXISTS / NOT EXISTS over a subquery that never references scope.

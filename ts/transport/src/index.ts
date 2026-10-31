@@ -3,11 +3,14 @@
 // it into localdb's writer worker (see localdb.ts).
 export { Applier, type ApplyResult, type Db, STATE_DDL } from './apply.ts'
 export {
+	type CloseDetail,
 	type ConnMode,
 	type Run,
 	SyncClient,
 	type SyncClientOptions,
+	type SyncState,
 	type Want,
+	type WantError,
 } from './client.ts'
 export {
 	type ColumnDesc,

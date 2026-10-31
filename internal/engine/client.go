@@ -24,6 +24,10 @@ type outMsg struct {
 	// response ends after a whole frame with units (serveHTTP).
 	part  bool
 	units bool
+	// tail: on a frame's last part, a text message that belongs with the
+	// frame follows ("synced"); on that message, it is the one. A response
+	// ends after the tail, not between them.
+	tail bool
 }
 
 // Client is one connection. Owned by the engine loop; the WebSocket
@@ -60,6 +64,9 @@ type Client struct {
 	// lastSend: when the engine last queued a message; an idle connection
 	// gets a beat so proxies' read timeouts (nginx: 60s) never cut it.
 	lastSend time.Time
+	// synced: "synced" was sent for the current WANT (every hold delivered
+	// or failed). Reset by each WANT.
+	synced bool
 }
 
 // Hold is a client's view of one unit: waiting for a snapshot, holding an
@@ -89,6 +96,62 @@ type Hold struct {
 	// (haveOK) only until the hold first delivers.
 	haveSum uint64
 	haveOK  bool
+	// broken: a unit the hold depends on keeps failing (Hold.failure). The
+	// hold is left out of the client's frontier and held empty until the
+	// unit recovers, then snapshotted afresh; brokenReset: the client may
+	// still have rows of it, dropped by the next frame.
+	broken      bool
+	brokenReset bool
+}
+
+// failure is the error of a unit the hold depends on that keeps failing.
+func (h *Hold) failure() string {
+	if h.u.failures >= failAfter {
+		return h.u.err
+	}
+	for _, g := range h.gates {
+		if g.u.failures >= failAfter {
+			return g.u.err
+		}
+	}
+	return ""
+}
+
+// checkFailures breaks holds whose units keep failing and mends those
+// whose units recovered. changed: the client's list of failing wants
+// (failureList) is different now.
+func (e *Engine) checkFailures(c *Client) (changed bool) {
+	for _, h := range c.holds {
+		msg := h.failure()
+		switch {
+		case msg != "" && !h.broken:
+			// A hold behind closed gates is already empty on the client.
+			h.brokenReset = !(h.delivered && h.off)
+			h.broken, h.delivered, h.off, h.reopen, h.haveOK, h.snapOps = true, false, false, false, false, nil
+			h.snapPending = true
+			changed = true
+		case msg == "" && h.broken:
+			h.broken, h.brokenReset = false, false
+			if h.snapPending {
+				// Unless the recovering query already handed it a snapshot.
+				e.requestSnapshot(h)
+			}
+			changed = true
+		}
+	}
+	return changed
+}
+
+// failureList is the client's failing wants, by id.
+func (c *Client) failureList() []wantErr {
+	errs := []wantErr{}
+	for _, h := range c.holds {
+		if h.broken {
+			errs = append(errs, wantErr{ID: h.id, Error: "query failed: " + h.failure()})
+		}
+	}
+	sort.Slice(errs, func(i, j int) bool { return errs[i].ID < errs[j].ID })
+	return errs
 }
 
 type gateHold struct {
@@ -299,6 +362,7 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 	// the very unit it now wants back, say), so a new hold then always
 	// gets the unit whole; holds that are kept need nothing.
 	first := c.holds == nil
+	c.synced = false
 	if first {
 		c.holds = map[uint32]*Hold{}
 		if m.Have.Epoch == e.epoch {
@@ -429,7 +493,11 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].ID < descs[j].ID })
 	e.m.refused += int64(len(errs))
-	c.sendJSON(map[string]any{"type": "units", "epoch": e.epoch, "units": descs, "errors": errs})
+	// errors: refused, for good (this WANT will not be served). failures:
+	// wants the engine cannot evaluate right now and keeps retrying; later
+	// changes to that list come as a "failures" message.
+	e.checkFailures(c)
+	c.sendJSON(map[string]any{"type": "units", "epoch": e.epoch, "units": descs, "errors": errs, "failures": c.failureList()})
 }
 
 // holdUnit finds or creates the unit of a for these parameter values and
@@ -482,13 +550,22 @@ const beatEvery = 15 * time.Second
 
 var beatMsg = map[string]string{"type": "beat"}
 
+var syncedMsg = map[string]string{"type": "synced"}
+
 func (e *Engine) frame(c *Client, empty bool) {
 	if c.holds == nil || c.stream != nil || (!c.exp.IsZero() && time.Now().After(c.exp)) {
 		return
 	}
+	if e.checkFailures(c) {
+		c.sendJSON(map[string]any{"type": "failures", "failures": c.failureList()})
+	}
 	f := e.head
 	waiting := false
 	for _, h := range c.holds {
+		if h.broken {
+			// Failing units hold no one back.
+			continue
+		}
 		if h.snapPending || (!h.delivered && !h.joinable(e.head)) {
 			waiting = true
 		}
@@ -499,6 +576,9 @@ func (e *Engine) frame(c *Client, empty bool) {
 	for {
 		g := f
 		for _, h := range c.holds {
+			if h.broken {
+				continue
+			}
 			if h.delivered || (!h.snapPending && h.snapB <= g) {
 				g = h.u.valid(g)
 			}
@@ -547,6 +627,13 @@ func (e *Engine) frame(c *Client, empty bool) {
 	c.removals = nil
 	for _, id := range ids {
 		h := c.holds[id]
+		if h.broken {
+			if h.brokenReset {
+				frags = append(frags, frag{ref: h.u.ref, reset: true})
+				h.brokenReset = false
+			}
+			continue
+		}
 		if h.snapPending {
 			continue
 		}
@@ -591,12 +678,26 @@ func (e *Engine) frame(c *Client, empty bool) {
 			frags = append(frags, frag{ref: u.ref, sum: sum, ops: ops})
 		}
 	}
+	// Caught up: every hold is delivered (or failing, reported apart). The
+	// client hears it after this frame, so "synced" means its database
+	// holds every unit it can have, at one LSN.
+	synced := !c.synced
+	for _, h := range c.holds {
+		if !h.broken && (!h.delivered || h.reopen) {
+			synced = false
+		}
+	}
 	if len(frags) == 0 && !c.forceFrame && (!empty || f == c.cursor) {
+		if synced {
+			c.synced = true
+			c.sendJSON(syncedMsg)
+		}
 		return
 	}
 	c.forceFrame = false
 	c.cursor = f
-	c.stream = &partStream{lsn: f, frags: frags}
+	c.synced = c.synced || synced
+	c.stream = &partStream{lsn: f, frags: frags, synced: synced}
 	e.pump(c)
 }
 
@@ -615,6 +716,8 @@ type partStream struct {
 	lsn    uint64
 	frags  []frag
 	fi, oi int
+	// synced: send "synced" after the last part.
+	synced bool
 }
 
 const (
@@ -655,7 +758,12 @@ func (e *Engine) pump(c *Client) {
 			c.stream = nil
 		}
 		buf := wire.AppendPartHeader(make([]byte, 0, len(body)+16), msg, s.lsn, units)
-		c.send(outMsg{data: append(buf, body...), part: msg == wire.MsgFramePart, units: units > 0})
+		last := msg == wire.MsgFrame
+		c.send(outMsg{data: append(buf, body...), part: !last, units: units > 0, tail: last && s.synced})
+		if last && s.synced {
+			b, _ := json.Marshal(syncedMsg)
+			c.send(outMsg{text: true, data: b, tail: true})
+		}
 	}
 }
 

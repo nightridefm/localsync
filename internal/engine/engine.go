@@ -118,8 +118,10 @@ type Engine struct {
 	roundBusy bool
 	requests  chan func()
 	waiting   []*query // results waiting for the stream to pass lsnS
-	stats     *stats
-	restarts  int // in-process restarts after a lost replication stream
+	// delayed are retries of failed queries, run at their unit's retryAt.
+	delayed  []*query
+	stats    *stats
+	restarts int // in-process restarts after a lost replication stream
 	// m is for /metrics: monotonic across in-process restarts (stats is
 	// per epoch). Loop-owned, except the atomics the writers add to.
 	m       metrics
@@ -333,6 +335,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			fn()
 			e.afterChange()
 		case <-tick.C:
+			e.retryDue()
 			e.prune()
 			e.pruneSnapCache()
 			e.afterChange()
@@ -377,12 +380,14 @@ func (e *Engine) restart(ctx context.Context, cause error) error {
 	e.relMap = map[uint32][]int{}
 	e.next = nil
 	e.waiting = nil
+	e.delayed = nil
 	for c := range e.clients {
 		c.holds = nil
 		c.cursor = 0
 		c.removals = nil
 		c.stream = nil
 		c.forceFrame = false
+		c.synced = false
 		// A frame cut short by this is never completed; the client drops
 		// its buffered parts on this message.
 		c.sendJSON(map[string]any{"type": "resync", "epoch": e.epoch})
@@ -700,32 +705,15 @@ func (e *Engine) resolve(q *query) {
 	if e.units[u.key] != u {
 		return // dropped meanwhile
 	}
-	if q.err != nil {
-		slog.Error("query failed", "unit", u.key, "err", q.err)
-		if q.forHolds {
-			u.snapIn = false
-			for _, h := range u.waiters {
-				h.c.fail("query failed: " + q.err.Error())
-			}
-			u.waiters = nil
-		} else {
-			u.inflight = false
-			if u.state == creating {
-				for c := range e.clients {
-					for _, h := range c.holds {
-						if h.u == u {
-							c.fail("query failed: " + q.err.Error())
-						}
-					}
-				}
-			}
-		}
-		return
-	}
 	if q.verify {
 		e.verifyResult(q)
 		return
 	}
+	if q.err != nil {
+		e.failed(q)
+		return
+	}
+	u.failures, u.err = 0, ""
 	b, regular := e.boundary(q)
 	if os.Getenv("LOCALSYNC_DEBUG") != "" {
 		slog.Info("resolve", "unit", u.key[:min(len(u.key), 40)], "full", q.full, "forHolds", q.forHolds, "b", b, "regular", regular,
@@ -757,6 +745,43 @@ func (e *Engine) resolve(q *query) {
 	if verifyMode && !q.verify {
 		e.next = append(e.next, &query{u: u, full: true, verify: true})
 	}
+}
+
+// failAfter: consecutive failures after which a unit's holds stop waiting
+// for it. The first failure is retried before anyone is told: a dropped
+// connection is not worth emptying a client's data for.
+const failAfter = 2
+
+// failed records a failed query and schedules its retry. The unit stays
+// inflight (or its snapshot query in flight) meanwhile, so nothing else
+// queries it; from failAfter on its holds leave their clients' frontiers
+// and are reported (checkFailures), so one bad unit stalls no one else.
+func (e *Engine) failed(q *query) {
+	u := q.u
+	u.failures++
+	u.err = q.err.Error()
+	backoff := min(250*time.Millisecond<<min(u.failures-1, 8), 30*time.Second)
+	u.retryAt = time.Now().Add(backoff)
+	slog.Error("query failed", "unit", u.key, "failures", u.failures, "retry_in", backoff, "err", q.err)
+	// The retry is a whole-unit evaluation: it covers every restriction
+	// pending by then, however many arrived meanwhile.
+	e.delayed = append(e.delayed, &query{u: u, full: true, forHolds: q.forHolds})
+}
+
+// retryDue moves failed queries whose time has come to the next round.
+func (e *Engine) retryDue() {
+	now := time.Now()
+	keep := e.delayed[:0]
+	for _, q := range e.delayed {
+		switch {
+		case e.units[q.u.key] != q.u:
+		case now.Before(q.u.retryAt):
+			keep = append(keep, q)
+		default:
+			e.next = append(e.next, q)
+		}
+	}
+	e.delayed = keep
 }
 
 // verifyMode (LOCALSYNC_VERIFY): after every resolution, re-evaluate the
@@ -1068,7 +1093,8 @@ func (e *Engine) prune() {
 		}
 	}
 	for _, u := range e.units {
-		if u.holds <= 0 && !u.idleSince.IsZero() && u.idleSince.Before(cutoff) && !u.inflight {
+		// A failing unit waits for its retry, not a result: it may go.
+		if u.holds <= 0 && !u.idleSince.IsZero() && u.idleSince.Before(cutoff) && (!u.inflight || u.failures > 0) {
 			e.dropUnit(u)
 			continue
 		}

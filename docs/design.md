@@ -192,7 +192,11 @@ is `row predicate AND gate`, the gate is a per-unit boolean computed with
 every full evaluation of the unit, and a change to a gate's tables
 re-evaluates the unit. The row predicate stays on the fast path, which is
 why 134 of App A's 140 tenant rules are tier 1 (measured on the private
-corpus).
+corpus). Each gate is numbered on its own and binds only the parameters it
+reads: a gate reading `$sub` alone, in a rule that also has `$project`,
+gets `$sub`. (v0.1.0 bound every parameter of the rule, and pgx refuses an
+unused argument; that only showed in rules that cannot be shared, `$sub`
+in the rows plus a client parameter, which App A has one of. Catalogue 19.)
 
 **Shared bodies.** When `$sub` appears only in gates, the rows do not
 depend on the principal, only whether they are visible at all. Such a
@@ -248,6 +252,15 @@ and which maintained sets it shares. Reviewing access means reading the
 Access column of `engine plan`.
 `engine plan rules.yaml --max-strategy=memory` lets CI fail when a rule
 needs Postgres re-queries for its common changes.
+
+`engine plan` also runs every rule the way the engine will (the Run
+column): its gates, then the body as a whole-unit query and as a
+restricted one, through the engine's own query code, read only and at
+most one row, with a sample value of each parameter's inferred type; for
+a shared rule, its body and gate rules as well. Analysis accepts SQL that
+fails only when run (a cast of a parameter, a gate bound wrongly), and
+those failures belong at deploy, not in a user's browser. Any failure
+exits non-zero; `--run=false` skips it.
 
 ## 4. Computing deltas
 
@@ -415,6 +428,19 @@ of query workers caps load on Postgres.
 - Head-of-line blocking is per client and only behind its own pending
   units; the global pipeline never waits. Priority classes are separate
   frontiers, so core data is never stuck behind a heavy table.
+- **Failing units hold no one back.** A query that fails (a rule that
+  errors for some parameters, a gate Postgres refuses) is retried as a
+  whole-unit evaluation with backoff (250 ms doubling to 30 s), the unit
+  staying in flight meanwhile so nothing else queries it. The first
+  failure is retried silently; from the second, every hold on the unit
+  (or on one of its gate units) is **broken**: left out of its client's
+  frontier, held empty on the client (a `RESET` in the next frame) and
+  reported (section 7). The client's other units carry on. When a query
+  for the unit succeeds again its holds are mended: each gets a fresh
+  snapshot and rejoins the frontier like a new want. (v0.1.0 left a unit
+  whose creating query failed in `creating` for good, with nothing to
+  re-run it; its `known` of 0 held every client wanting it at its cursor,
+  so one bad rule emptied App A's whole project database. Catalogue 21.)
 
 Transactional subscription changes fall out: a new unit starts pending;
 the client's frontier (for that class) waits for it, then one frame
@@ -437,6 +463,22 @@ answers per unit:
 | anything else (older cursor, new epoch, after an engine restart) | evaluate the unit at a regular snapshot; equal checksum: nothing, just known through `B`; different: `RESET` + rows |
 | unit not held | `RESET` + rows |
 | unit held but not in the wants | nothing from the engine; the client drops it inside the next frame's transaction (the engine forces one) |
+
+**Refused and failing wants.** The `UNITS` answer lists refused wants
+(`errors`: unknown rule, not allowed, a missing or unknown parameter),
+which this `WANT` will never get, apart from failing ones (`failures`:
+broken holds, section 6), which the engine keeps retrying. Later changes
+to the failing list come as a `FAILURES` message. The client reports
+both to the app (section 10.1).
+
+**Caught up.** After the frame in which every hold of the latest `WANT`
+is delivered (or broken), the engine sends `SYNCED`, once per `WANT`. The
+client reports `live` only then, after that frame is applied: `live`
+means the local database holds every unit it can have, at one LSN.
+(v0.1.0's client said `live` when the socket opened, before any data;
+App A showed "No modules yet" on a page that had modules. Catalogue 20
+and the browser smoke check that the first `live` comes with the whole
+load.)
 
 Haves describe the principal they were synced for: the client names each
 unit by (rule, params, the token's `sub`), so when another user signs in
@@ -563,7 +605,9 @@ only on the last piece. Integers are LEB128 varints.
 | Direction | Message | Body |
 | --- | --- | --- |
 | client | `WANT` (JSON) | token, wants `[(id, rule, params)]`, haves `(epoch, cursor, [(id, checksum)])`; always the full set |
-| engine | `UNITS` (JSON) | per want: client id, engine ref, rule, table, columns, PK positions, or an error |
+| engine | `UNITS` (JSON) | per want: client id, engine ref, rule, table, columns, PK positions; refused wants (`errors`) and failing ones (`failures`), by id |
+| engine | `FAILURES` (JSON) | the failing wants changed: the full list, by id |
+| engine | `SYNCED` (JSON) | caught up on the latest `WANT`: follows the frame that completed it (a response never ends between them) |
 | engine | `SCHEMA` | table descriptors (or changes) at an LSN, before the frame that needs them |
 | engine | `FRAME` | lsn, `[fragment]`; an empty frame just advances the cursor |
 | engine | `ERROR` (JSON) | message |
@@ -648,6 +692,20 @@ access goes through `ctx.run(fn)`, which localdb executes inside its write
 fence, so frames commit exactly like Electric batches and broadcast the
 same commit notices. `LocalDb.syncCommand({ want })` changes the wanted set
 (e.g. a project switch).
+
+Status, as localdb's `SyncStatus`:
+
+| Status | When |
+| --- | --- |
+| `connecting` | connecting, and connected but not caught up yet |
+| `live` | `SYNCED` applied (section 7); again whenever every want is served after a failure |
+| `error` | the connection closed: the actual reason (`token endpoint 401`, `no answer to WANT`, ...), the real retry delay, and the token endpoint's `httpStatus` when that is what failed |
+| `failed` | after `live`, some wants are not served: name, error and `permanent` (refused) per want; everything else is live |
+
+`error` is a blip the transport retries; `failed` with a permanent
+failure is a client and rules mismatch (a deploy skew, a bug) that the
+app should show. Before v0.1.1 every failure became `error: connection
+closed, retry in 250ms`.
 
 Original sketch:
 

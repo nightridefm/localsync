@@ -223,7 +223,9 @@ func (e *Engine) writeLoop(ctx context.Context, c *Client, write func(outMsg) er
 				return false
 			}
 			if !m.text {
-				inFrame = m.part
+				inFrame = m.part || m.tail
+			} else if m.tail {
+				inFrame = false
 			}
 			if !inFrame && (expired || (stop != nil && stop(m))) {
 				return false

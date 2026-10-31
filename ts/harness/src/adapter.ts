@@ -23,6 +23,13 @@ export interface Client {
 	bytes(): number
 	/** Errors the client hit (apply failures etc.), for failure messages. */
 	errors(): string[]
+	/**
+	 * The client says it is caught up on every want the server serves (the
+	 * moment an app would stop showing "loading"). Absent: no such signal.
+	 */
+	caughtUp?(): boolean
+	/** Wants the server does not serve now: refused (permanent) or failing. */
+	failedWants?(): Array<{ rule: string; error: string; permanent: boolean }>
 	close(): Promise<void>
 }
 

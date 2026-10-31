@@ -78,6 +78,19 @@ async function main(): Promise<void> {
 	console.log(
 		`ok   initial load in a real browser (two tabs): 200 tasks + 200 comments in ${Date.now() - t0}ms (incl. wasm boot)`
 	)
+	// Each tab's 'live' status (the leader's sync reports it to both) came
+	// with everything in the database, not before.
+	for (const tab of [aligned, plain]) {
+		await waitFor(
+			async () => last(await tab.events(), 'live-counts') !== undefined,
+			"a 'live' status",
+			10_000
+		)
+		const first = (await tab.events()).find((e) => e[0] === 'live-counts')?.[1]
+		if (first !== '200/200')
+			throw new Error(`'live' with ${String(first)} tasks/comments, not 200/200`)
+	}
+	console.log("ok   'live' only once caught up: 200/200 at the first 'live' in both tabs")
 
 	const pairs: Array<{ task: string; comment: string }> = []
 	for (let i = 0; i < 30; i++) {

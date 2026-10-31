@@ -28,6 +28,8 @@ export class Conn {
 	readonly client: Client
 	wants: Want[]
 	readonly catalog: Catalog
+	/** The client also wants things left out of the comparison (Ctx.connect). */
+	unchecked = false
 
 	constructor(ctx: Ctx, principal: Principal, client: Client, wants: Want[], catalog: Catalog) {
 		this.ctx = ctx
@@ -132,11 +134,16 @@ export class Ctx {
 		this.catalog = await introspect(this.db)
 	}
 
-	async connect(p: Principal, wants: Array<Want | string>): Promise<Conn> {
+	/**
+	 * unchecked: also wanted by the client, but left out of the oracle
+	 * comparison (wants expected to fail).
+	 */
+	async connect(p: Principal, wants: Array<Want | string>, unchecked: Want[] = []): Promise<Conn> {
 		const ws = wants.map((w) => (typeof w === 'string' ? { rule: w } : w))
-		const bounds = this.bindAll(p, ws)
+		const bounds = this.bindAll(p, [...ws, ...unchecked])
 		const client = await this.adapter.connect(p, bounds, this.catalog)
 		const conn = new Conn(this, p, client, ws, this.catalog)
+		conn.unchecked = unchecked.length > 0
 		this.conns.push(conn)
 		return conn
 	}
@@ -171,8 +178,9 @@ export class Ctx {
 			// a claim is an access outcome the oracle checks (empty).
 			const refused = conn.client
 				.errors()
-				.find((e) => /^unit \d+: /.test(e) && !e.includes(': not allowed:'))
-			if (refused) throw new Fail(`engine refused a want: ${refused}`)
+				.find((e) => /^(unit \d+|want \S+): /.test(e) && !e.includes(': not allowed:'))
+			// Unless the scenario wants something it expects to fail.
+			if (refused && !conn.unchecked) throw new Fail(`engine refused a want: ${refused}`)
 			const d = counts
 				? diff(await conn.oracle(), conn.replicaRows())
 				: [{ table: '', pk: '', kind: 'missing' as const }]

@@ -42,7 +42,16 @@ const db = new LocalDb(
 )
 w.__db = db
 
-db.onSyncStatus((s) => events.push(['status', s.state]))
+db.onSyncStatus((s) => {
+	events.push(['status', s.state])
+	// 'live' means caught up: what the database holds at that moment.
+	if (s.state === 'live')
+		void db
+			.query<{ t: number; c: number }>(
+				'SELECT (SELECT count(*) FROM task) AS t, (SELECT count(*) FROM comment) AS c'
+			)
+			.then((r) => events.push(['live-counts', `${r[0]?.t}/${r[0]?.c}`]))
+})
 db.subscribe<{ n: number }>({ sql: 'SELECT count(*) AS n FROM task' }, (r) => {
 	if (r.error) w.__error = r.error
 	events.push(['tasks', r.rows[0]?.n])

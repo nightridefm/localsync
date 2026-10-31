@@ -25,6 +25,9 @@ type query struct {
 	verify bool
 	restr  []restriction
 	maxLSN uint64 // largest LSN among restrictions included
+	// probe (engine plan, Check): run the body even behind a closed gate,
+	// one row at most.
+	probe bool
 
 	// results
 	snap   snapshot
@@ -116,8 +119,12 @@ func columnList(u *Unit, alias string) string {
 
 func (q *query) sql() string {
 	u := q.u
+	limit := ""
+	if q.probe {
+		limit = " LIMIT 1"
+	}
 	if q.full {
-		return "SELECT " + columnList(u, "x") + " FROM (" + u.a.SQL + ") x"
+		return "SELECT " + columnList(u, "x") + " FROM (" + u.a.SQL + ") x" + limit
 	}
 	var join []string
 	for _, pk := range u.a.Table.PK {
@@ -128,7 +135,7 @@ func (q *query) sql() string {
 		where = append(where, "("+r.sql+")")
 	}
 	return "SELECT " + columnList(u, "r") + ", EXISTS (SELECT 1 FROM (" + u.a.SQL + ") x WHERE " +
-		strings.Join(join, " AND ") + ") FROM " + rules.Ident(u.a.Table.Name) + " r WHERE " + strings.Join(where, " OR ")
+		strings.Join(join, " AND ") + ") FROM " + rules.Ident(u.a.Table.Name) + " r WHERE " + strings.Join(where, " OR ") + limit
 }
 
 func paramArgs(params []string) []any {
@@ -165,7 +172,10 @@ func (q *query) run(ctx context.Context, pool *pgxpool.Pool, snapID string) {
 		args := append([]any{pgx.QueryExecModeSimpleProtocol}, paramArgs(q.u.params)...)
 		q.gateOK = true
 		for _, g := range q.u.a.Gates {
-			rows, err := tx.Query(ctx, g, args...)
+			// Each gate binds only the parameters it reads: pgx refuses an
+			// unused argument.
+			gargs := append([]any{pgx.QueryExecModeSimpleProtocol}, paramArgs(g.GateArgs(q.u.params))...)
+			rows, err := tx.Query(ctx, g.SQL, gargs...)
 			if err != nil {
 				return err
 			}
@@ -178,7 +188,7 @@ func (q *query) run(ctx context.Context, pool *pgxpool.Pool, snapID string) {
 				q.gateOK = false
 			}
 		}
-		if !q.gateOK && q.full {
+		if !q.gateOK && q.full && !q.probe {
 			return nil
 		}
 		rows, err := tx.Query(ctx, q.sql(), args...)

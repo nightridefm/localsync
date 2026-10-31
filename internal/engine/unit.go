@@ -87,6 +87,13 @@ type Unit struct {
 	inflight bool
 	buffered []change
 
+	// failures counts the unit's consecutive failed queries (err is the
+	// last one's); the query is retried at retryAt, backing off. From
+	// failAfter on, holds stop waiting for the unit (Hold.failure).
+	failures int
+	err      string
+	retryAt  time.Time
+
 	hist      []entry
 	histBytes int     // encoded bytes held in hist
 	cur       []opRec // ops of the transaction being routed

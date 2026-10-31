@@ -102,6 +102,7 @@ export class LocalsyncClient implements Client {
 	private listeners = new Set<() => void>()
 	private received = 0
 	private bounds: Bound[]
+	private live = false
 
 	constructor(replica: Replica, principal: Principal, bounds: Bound[], conn: ConnOptions) {
 		const sub = principal.sub
@@ -124,6 +125,9 @@ export class LocalsyncClient implements Client {
 			},
 			onBytes: (n) => {
 				this.received += n
+			},
+			onState: (s) => {
+				this.live = s === 'live'
 			},
 			onError: (m) => {
 				if (DEBUG) console.error(`[localsync] ${m}`)
@@ -185,6 +189,14 @@ export class LocalsyncClient implements Client {
 
 	errors(): string[] {
 		return this.sync.errors
+	}
+
+	caughtUp(): boolean {
+		return this.live
+	}
+
+	failedWants(): Array<{ rule: string; error: string; permanent: boolean }> {
+		return this.sync.wantErrors
 	}
 
 	async close(): Promise<void> {

@@ -10,9 +10,10 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/nightridefm/localsync/internal/catalog"
+	"github.com/nightridefm/localsync/internal/engine"
 	"github.com/nightridefm/localsync/internal/rules"
 )
 
@@ -25,6 +26,7 @@ func plan(args []string) error {
 	prefix := fs.String("prefix", "", "with --corpus: only shapes whose file starts with this")
 	gate := fs.String("gate", "", "with --corpus: SQL gate ANDed into rules that use a client parameter")
 	maxTier := fs.Int("max-tier", 3, "exit non-zero if any rule lands above this tier")
+	run := fs.Bool("run", true, "run every rule and gate (read only, one row) with sample parameters, as the engine will")
 	_ = fs.Parse(args)
 
 	var rs []rules.Rule
@@ -41,27 +43,41 @@ func plan(args []string) error {
 		return err
 	}
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, *pgURL)
+	pool, err := pgxpool.New(ctx, *pgURL)
 	if err != nil {
 		return err
 	}
-	defer conn.Close(ctx)
-	cat, err := catalog.Load(ctx, conn)
+	defer pool.Close()
+	cat, err := catalog.Load(ctx, pool)
 	if err != nil {
 		return err
 	}
 
 	counts := map[string]int{}
 	worst := 0
-	fmt.Println("| Rule | Table | Access | Tier | Strategy | Depends on | Notes |")
-	fmt.Println("| --- | --- | --- | --- | --- | --- | --- |")
+	failed := 0
+	fmt.Println("| Rule | Table | Access | Tier | Strategy | Depends on | Run | Notes |")
+	fmt.Println("| --- | --- | --- | --- | --- | --- | --- | --- |")
 	for _, r := range rs {
 		a, err := rules.Analyze(r, cat)
 		if err != nil {
 			counts["rejected"]++
 			worst = 4
-			fmt.Printf("| %s | | | rejected | | | %s |\n", r.Name, md(err.Error()))
+			fmt.Printf("| %s | | | rejected | | | | %s |\n", r.Name, md(err.Error()))
 			continue
+		}
+		ran := "not run"
+		if *run {
+			shared, err := engine.Check(ctx, pool, cat, a)
+			switch {
+			case err != nil:
+				failed++
+				ran = "FAILED: " + err.Error()
+			case shared:
+				ran = "ok (shared)"
+			default:
+				ran = "ok"
+			}
 		}
 		counts[fmt.Sprintf("tier %d", a.Tier)]++
 		worst = max(worst, a.Tier)
@@ -72,11 +88,18 @@ func plan(args []string) error {
 				strategy += " (Phase 4: maintained sets)"
 			}
 		}
-		fmt.Printf("| %s | %s | %s | %d | %s | %s | %s |\n", r.Name, a.Table.Name, md(a.Access()), a.Tier, strategy, strings.Join(a.Deps, ", "), md(strings.Join(a.Notes, "; ")))
+		fmt.Printf("| %s | %s | %s | %d | %s | %s | %s | %s |\n", r.Name, a.Table.Name, md(a.Access()), a.Tier, strategy, strings.Join(a.Deps, ", "), md(ran), md(strings.Join(a.Notes, "; ")))
 	}
-	fmt.Printf("\n%d rules: tier 1 %d, tier 2 %d, tier 3 %d, rejected %d\n", len(rs), counts["tier 1"], counts["tier 2"], counts["tier 3"], counts["rejected"])
+	fmt.Printf("\n%d rules: tier 1 %d, tier 2 %d, tier 3 %d, rejected %d", len(rs), counts["tier 1"], counts["tier 2"], counts["tier 3"], counts["rejected"])
+	if *run {
+		fmt.Printf(", failed to run %d", failed)
+	}
+	fmt.Println()
 	if worst > *maxTier {
 		return fmt.Errorf("a rule is above --max-tier %d", *maxTier)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d rules failed to run", failed)
 	}
 	return nil
 }

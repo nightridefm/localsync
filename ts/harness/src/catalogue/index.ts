@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 
 import { Unsupported } from '../adapter.ts'
 import { seedSink, seedWorld } from '../fixture.ts'
+import { diff, formatDiff } from '../oracle.ts'
 import { Ctx, Fail, type Scenario } from '../scenario.ts'
 import type { Query } from '../pg.ts'
 
@@ -852,6 +853,98 @@ export const catalogue: Scenario[] = [
 			const n = (c: (typeof conns)[number]) =>
 				c.client.replica.db.selectValue('SELECT count(*) FROM task')
 			return `alice ${n(conns[0]!)} tasks, bob ${n(conns[1]!)}, carol ${n(conns[2]!)}; no row outside visibility`
+		},
+	},
+	{
+		id: '19',
+		title: '$sub in the rows, a client parameter and a gate on some of the parameters',
+		async run(ctx) {
+			const p = ctx.principal()
+			let w!: Awaited<ReturnType<typeof seedWorld>>
+			await ctx.write(async (q) => {
+				w = await seedWorld(q, {
+					orgs: 2,
+					projects: 1,
+					tasks: 1,
+					comments: 0,
+					memberOf: [[p.sub], [p.sub]],
+				})
+			})
+			const c = await ctx.connect(p, [
+				{ rule: 'own_membership', params: { project: w.projects[0]! } },
+				'tasks',
+			])
+			await ctx.converge(c)
+			// The gate closes, then opens again.
+			await ctx.write(`UPDATE project SET archived = true WHERE id = $1`, [w.projects[0]])
+			await ctx.converge(c)
+			await ctx.write(`UPDATE project SET archived = false WHERE id = $1`, [w.projects[0]])
+			return `${await ctx.converge(c)}ms`
+		},
+	},
+	{
+		id: '20',
+		title: 'caught up means complete: the replica equals the oracle once the client says so',
+		async run(ctx) {
+			const p = ctx.principal()
+			await ctx.write(async (q) => {
+				await seedWorld(q, { orgs: 1, projects: 4, tasks: 500, comments: 2, memberOf: [[p.sub]] })
+			})
+			const c = await ctx.connect(p, ['projects', 'tasks', 'comments'])
+			if (!c.client.caughtUp) throw new Unsupported('the client has no caught-up signal')
+			const start = Date.now()
+			while (!c.client.caughtUp()) {
+				if (Date.now() - start > 30_000) throw new Fail('never caught up')
+				await sleep(5)
+			}
+			const ms = Date.now() - start
+			const d = diff(await c.oracle(), c.replicaRows())
+			if (d.length)
+				throw new Fail(`caught up with ${d.length} rows missing or wrong:\n${formatDiff(d)}`)
+			return `caught up in ${ms}ms, ${c.client.replica.db.selectValue('SELECT count(*) FROM comment')} comments`
+		},
+	},
+	{
+		id: '21',
+		title: 'a want the server cannot evaluate holds back no other, and recovers',
+		async run(ctx) {
+			const p = ctx.principal()
+			// Valid SQL that fails at run time for a bad parameter value.
+			ctx.addRule({
+				name: 'sink_n',
+				sql: 'SELECT * FROM kitchen_sink WHERE owner = $sub AND i4 = $n::int',
+				params: ['n'],
+			})
+			await ctx.write(async (q) => {
+				await seedWorld(q, { orgs: 1, projects: 1, tasks: 50, comments: 0, memberOf: [[p.sub]] })
+				await q(`INSERT INTO kitchen_sink (id, owner, i4) VALUES (gen_random_uuid(), $1, 7)`, [
+					p.sub,
+				])
+			})
+			const bad = { rule: 'sink_n', params: { n: 'oops' } }
+			const c = await ctx.connect(p, ['tasks'], [bad])
+			if (!c.client.failedWants || !c.client.caughtUp)
+				throw new Unsupported('the client does not report failing wants')
+			await ctx.converge(c)
+			const start = Date.now()
+			const failing = () => c.client.failedWants!().find((f) => f.rule === 'sink_n')
+			while (!failing() || !c.client.caughtUp()) {
+				if (Date.now() - start > 10_000)
+					throw new Fail(`failing want not reported (caught up: ${c.client.caughtUp()})`)
+				await sleep(20)
+			}
+			if (failing()!.permanent) throw new Fail('a failing query reported as refused')
+			// Changes to the healthy want keep flowing.
+			await ctx.write(`UPDATE task SET title = 'still live'`)
+			await ctx.converge(c)
+			// A good value for the same rule: served, and the failure clears.
+			await c.want([{ rule: 'tasks' }, { rule: 'sink_n', params: { n: '7' } }])
+			const ms = await ctx.converge(c)
+			while (c.client.failedWants!().length) {
+				if (Date.now() - start > 20_000) throw new Fail('failure never cleared')
+				await sleep(20)
+			}
+			return `reported as failing, others live; fixed want served in ${ms}ms`
 		},
 	},
 ]

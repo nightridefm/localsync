@@ -197,8 +197,14 @@ func TestGateAndNotIn(t *testing.T) {
 	if m == nil || !m.Full || m.Narrow == nil {
 		t.Fatalf("gate occurrence %+v", m)
 	}
-	if !a.Fast || len(a.Gates) != 1 || !strings.HasPrefix(a.Gates[0], "SELECT 1 WHERE EXISTS") {
-		t.Errorf("gated fast rule: fast=%v gates=%q", a.Fast, a.Gates)
+	if !a.Fast || len(a.Gates) != 1 || !strings.HasPrefix(a.Gates[0].SQL, "SELECT 1 WHERE EXISTS") {
+		t.Errorf("gated fast rule: fast=%v gates=%v", a.Fast, a.Gates)
+	}
+	// The gate reads $sub alone (the rule's $2): numbered on its own, it
+	// binds that one value (pgx refuses unused arguments).
+	if g := a.Gates[0]; !strings.Contains(g.SQL, "$1") || strings.Contains(g.SQL, "$2") || !slices.Equal(g.Args, []int{1}) ||
+		!slices.Equal(g.GateArgs([]string{"p1", "u1"}), []string{"u1"}) {
+		t.Errorf("gate parameters: %q args %v", g.SQL, g.Args)
 	}
 	n := analyze(t, c, `SELECT * FROM task WHERE id NOT IN (SELECT task_id FROM comment WHERE body = 'hide')`)
 	if o := occ(n, "comment"); o == nil || !o.NullSensitive || o.Full {

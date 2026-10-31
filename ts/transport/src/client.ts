@@ -9,6 +9,24 @@ import { type Conn, HttpConn, httpUrlFor, WsConn } from './http.ts'
 
 export type Want = { rule: string; params?: Record<string, string> }
 
+/**
+ * A want the engine does not serve. permanent: refused (unknown rule, not
+ * allowed, bad parameters); this WANT will never be served. Otherwise the
+ * engine cannot evaluate it right now and keeps retrying; it leaves the
+ * list when it recovers.
+ */
+export type WantError = Want & { error: string; permanent: boolean }
+
+/** Why the connection closed, and when the client tries again. */
+export type CloseDetail = { error: string; retryInMs: number; httpStatus?: number }
+
+/**
+ * 'open': connected, catching up. 'live': caught up on every want the
+ * engine serves (the local database holds all of them at one point in
+ * time); a new want list goes back to 'open' until it is.
+ */
+export type SyncState = 'connecting' | 'open' | 'live' | 'closed'
+
 /** Exclusive access to the local database (localdb runs it inside its write fence). */
 export type Run = <T>(fn: (db: Db) => T) => Promise<T>
 
@@ -20,8 +38,10 @@ export type SyncClientOptions = {
 	run?: Run
 	/** After every applied frame, with the local tables it touched. */
 	onCommit?: (tables: Set<string>, rows: number) => void
-	/** Socket state, for status reporting. */
-	onState?: (state: 'connecting' | 'open' | 'closed') => void
+	/** Connection state, for status reporting; detail is set for 'closed'. */
+	onState?: (state: SyncState, detail?: CloseDetail) => void
+	/** The wants the engine does not serve changed (refused or failing). */
+	onWantErrors?: (errors: WantError[]) => void
 	onError?: (message: string) => void
 	/** Payload bytes received (frames and control), for measurement. */
 	onBytes?: (n: number) => void
@@ -38,12 +58,20 @@ export type SyncClientOptions = {
 /** How the client is connecting: a WebSocket, a streamed HTTP response or long polls. */
 export type ConnMode = 'websocket' | 'stream' | 'poll'
 
+type IdError = { id: number; error: string }
 type UnitsMsg = {
 	type: 'units'
 	epoch: string
 	units: UnitDesc[]
-	errors: Array<{ id: number; error: string }>
+	/** Refused for good. */
+	errors: IdError[]
+	/** Failing for now (the engine retries). */
+	failures?: IdError[]
 }
+/** The failing wants changed. */
+type FailuresMsg = { type: 'failures'; failures: IdError[] }
+/** Every want is delivered (or failing): the client is caught up. */
+type SyncedMsg = { type: 'synced' }
 type ErrorMsg = { type: 'error'; message: string }
 /** The engine restarted in process (lost its replication stream): send WANT again. */
 type ResyncMsg = { type: 'resync'; epoch: string }
@@ -95,7 +123,14 @@ export class SyncClient {
 	/** Got a message on the current connection; got an error message. */
 	private heard = false
 	private failed = false
-	private state: 'connecting' | 'open' | 'closed' | null = null
+	private state: SyncState | null = null
+	/** The last error on this connection, for the close detail. */
+	private lastError = ''
+	private lastHttpStatus: number | undefined
+	/** Unit id -> want, for the wants sent last. */
+	private sent = new Map<number, Want>()
+	private refused: WantError[] = []
+	private failing: WantError[] = []
 	private watch: ReturnType<typeof setTimeout> | null = null
 	private mode: ConnMode
 	private wsFailures = 0
@@ -181,7 +216,14 @@ export class SyncClient {
 	/** Replace the wanted set; applied atomically by the engine. */
 	async want(wants: Want[]): Promise<void> {
 		this.wants = wants
+		// Not caught up on the new list until the engine says so.
+		if (this.state === 'live') this.setState('open')
 		await this.rewant()
+	}
+
+	/** The wants the engine does not serve now (refused, then failing). */
+	get wantErrors(): WantError[] {
+		return [...this.refused, ...this.failing]
 	}
 
 	/** Send WANT again; over HTTP that is a new request. */
@@ -238,6 +280,7 @@ export class SyncClient {
 		)
 		const conn = this.conn
 		if (!conn?.open) return
+		this.sent = new Map(wants.map((w) => [w.id, { rule: w.rule, params: w.params }]))
 		conn.send(
 			JSON.stringify({
 				type: 'want',
@@ -308,14 +351,24 @@ export class SyncClient {
 		this.conn = conn
 		this.heard = false
 		this.failed = false
+		this.lastError = ''
+		this.lastHttpStatus = undefined
 		// Through the queue: frames of the previous connection may still be applying.
 		this.parts = []
 		void this.enqueue(async () => this.applier.resetRefs())
 		// The next HTTP request of a live client is not a reconnect.
-		if (this.state !== 'open') this.setState('connecting')
+		if (this.state !== 'open' && this.state !== 'live') this.setState('connecting')
 		conn.onopen = () => {
 			if (this.conn !== conn) return
-			this.sendWant().catch((err: unknown) => this.error(`token: ${String(err)}`))
+			this.sendWant().catch((err: unknown) => {
+				// No token, no WANT: close, so the retry (with backoff) fetches
+				// one again instead of leaving an idle connection.
+				const status = (err as { status?: unknown } | null)?.status
+				this.lastHttpStatus = typeof status === 'number' ? status : undefined
+				this.error(`token: ${String(err)}`)
+				this.failed = true
+				if (this.conn === conn) conn.close()
+			})
 		}
 		conn.onmessage = (data) => {
 			if (this.conn !== conn) return
@@ -323,7 +376,7 @@ export class SyncClient {
 				this.heard = true
 				this.backoff = 250
 				if (this.mode === 'websocket') this.wsFailures = 0
-				this.setState('open')
+				if (this.state !== 'live') this.setState('open')
 				this.storeMode()
 			}
 			this.watchdog(conn, idleMs)
@@ -355,26 +408,64 @@ export class SyncClient {
 				this.connect()
 				return
 			}
-			this.setState('closed')
+			this.setState('closed', {
+				error: this.lastError || 'connection closed',
+				retryInMs: this.backoff,
+				httpStatus: this.lastHttpStatus,
+			})
 			this.timer = setTimeout(() => this.connect(), this.backoff)
 			this.backoff = Math.min(this.backoff * 2, 10_000)
 		}
 	}
 
-	private setState(s: 'connecting' | 'open' | 'closed'): void {
+	private setState(s: SyncState, detail?: CloseDetail): void {
 		if (this.state === s) return
 		this.state = s
-		this.opts.onState?.(s)
+		this.opts.onState?.(s, detail)
+	}
+
+	private wantErrorsOf(errs: IdError[], permanent: boolean): WantError[] {
+		const out: WantError[] = []
+		for (const e of errs) {
+			const w = this.sent.get(e.id) ?? { rule: `unit ${e.id}` }
+			out.push({ ...w, error: e.error, permanent })
+		}
+		return out
+	}
+
+	private setWantErrors(refused: WantError[] | null, failing: WantError[]): void {
+		const before = JSON.stringify([this.refused, this.failing])
+		if (refused) this.refused = refused
+		this.failing = failing
+		if (JSON.stringify([this.refused, this.failing]) !== before)
+			this.opts.onWantErrors?.(this.wantErrors)
 	}
 
 	private message(data: string | ArrayBuffer, conn: Conn): void {
 		if (typeof data === 'string') {
 			this.opts.onBytes?.(data.length)
-			const m = JSON.parse(data) as UnitsMsg | ErrorMsg | ResyncMsg | BeatMsg
+			const m = JSON.parse(data) as
+				| UnitsMsg
+				| FailuresMsg
+				| SyncedMsg
+				| ErrorMsg
+				| ResyncMsg
+				| BeatMsg
 			if (m.type === 'units') {
 				this.epoch = m.epoch
 				void this.enqueue(() => this.run((db) => this.applier.setUnits(db, m.units)))
-				for (const e of m.errors ?? []) this.error(`unit ${e.id}: ${e.error}`)
+				const refused = this.wantErrorsOf(m.errors ?? [], true)
+				for (const e of refused) this.error(`want ${e.rule}: ${e.error}`)
+				this.setWantErrors(refused, this.wantErrorsOf(m.failures ?? [], false))
+			} else if (m.type === 'failures') {
+				for (const e of m.failures) this.error(`unit ${e.id}: ${e.error}`)
+				this.setWantErrors(null, this.wantErrorsOf(m.failures, false))
+			} else if (m.type === 'synced') {
+				// After the frame before it is applied: 'live' means the local
+				// database holds it.
+				void this.enqueue(async () => {
+					if (this.conn === conn) this.setState('live')
+				})
 			} else if (m.type === 'error') {
 				this.failed = true
 				this.error(m.message)
@@ -383,6 +474,7 @@ export class SyncClient {
 				// were never applied. Refs are per epoch, like a reconnect.
 				this.parts = []
 				void this.enqueue(async () => this.applier.resetRefs())
+				if (this.state === 'live') this.setState('open')
 				this.rewant().catch((err: unknown) => this.error(`resync: ${String(err)}`))
 			}
 			return
@@ -417,6 +509,7 @@ export class SyncClient {
 	}
 
 	private error(msg: string): void {
+		this.lastError = msg
 		this.errors.push(msg)
 		this.opts.onError?.(msg)
 	}

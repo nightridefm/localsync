@@ -76,6 +76,14 @@ export const RULES: Record<string, Rule> = Object.fromEntries(
 				`SELECT * FROM comment WHERE task_id IN (SELECT id FROM task WHERE project_id = $project) AND ${memberGate}`,
 				['project'],
 			],
+			// $sub in the rows and a client parameter (not shareable), with a
+			// gate that reads only some of the parameters (here $project):
+			// the gate must bind just those.
+			[
+				'own_membership',
+				`SELECT * FROM member WHERE user_id = $sub AND EXISTS (SELECT 1 FROM project WHERE id = $project AND NOT archived)`,
+				['project'],
+			],
 			[
 				'project_comments',
 				`SELECT * FROM comment WHERE task_id IN (SELECT id FROM task WHERE project_id = $project AND project_id IN (${visibleProjects}))`,
