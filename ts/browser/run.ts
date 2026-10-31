@@ -38,9 +38,9 @@ async function main(): Promise<void> {
 
 	// Two tabs on the same writes, each its own database: one with
 	// LocalDbConfig.alignCommits, one without.
-	const open = async (align: boolean) => {
+	const open = async (align: boolean, run = randomUUID().slice(0, 8)) => {
 		const qs = new URLSearchParams({
-			run: randomUUID().slice(0, 8),
+			run,
 			ws: SYNC_URL,
 			transport: TRANSPORT,
 			token: mintToken(sub),
@@ -55,7 +55,7 @@ async function main(): Promise<void> {
 			if (v.err) throw new Error(`page error: ${v.err}`)
 			return v.e
 		}
-		return { page, events }
+		return { page, events, run }
 	}
 	const last = (ev: Ev[], name: string) => ev.filter((e) => e[0] === name).at(-1)?.[1]
 	const aligned = await open(true)
@@ -91,6 +91,27 @@ async function main(): Promise<void> {
 			throw new Error(`'live' with ${String(first)} tasks/comments, not 200/200`)
 	}
 	console.log("ok   'live' only once caught up: 200/200 at the first 'live' in both tabs")
+	// The FTS mirror exists and is built by then.
+	for (const tab of [aligned, plain]) {
+		await waitFor(
+			async () => last(await tab.events(), 'live-search') !== undefined,
+			"a search at 'live'",
+			10_000
+		)
+		const n = (await tab.events()).find((e) => e[0] === 'live-search')?.[1]
+		if (n !== 200) throw new Error(`search at 'live' found ${String(n)}, not 200`)
+	}
+	console.log("ok   FTS mirror built by 'live': search finds all 200 tasks in both tabs")
+	// A tab opened after 'live' on the same database is a standby: it hears
+	// the leader's current status, not only later changes.
+	const late = await open(false, plain.run)
+	await waitFor(
+		async () => (await late.events()).some((e) => e[0] === 'status' && e[1] === 'live'),
+		"'live' in a tab opened after the leader went live",
+		15_000
+	)
+	late.page.close()
+	console.log("ok   a tab opened later on the same database hears the leader's 'live'")
 
 	const pairs: Array<{ task: string; comment: string }> = []
 	for (let i = 0; i < 30; i++) {

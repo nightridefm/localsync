@@ -24,6 +24,8 @@ const db = new LocalDb(
 		// 3: the task and comment queries pin to different readers (table
 		// affinity), which is where cross-query tearing can happen.
 		readers: 3,
+		// The search mirror is built once the transport is caught up.
+		fts: [{ table: 'task', columns: ['title'] }],
 		alignCommits: params.get('align') === '1',
 		sync: {
 			transport: 'localsync',
@@ -51,6 +53,13 @@ db.onSyncStatus((s) => {
 				'SELECT (SELECT count(*) FROM task) AS t, (SELECT count(*) FROM comment) AS c'
 			)
 			.then((r) => events.push(['live-counts', `${r[0]?.t}/${r[0]?.c}`]))
+	if (s.state === 'live')
+		void db
+			.query<{ n: number }>(`SELECT count(*) AS n FROM task_fts WHERE task_fts MATCH '"task"'`)
+			.then(
+				(r) => events.push(['live-search', r[0]?.n]),
+				(err: unknown) => events.push(['live-search', String(err)])
+			)
 })
 db.subscribe<{ n: number }>({ sql: 'SELECT count(*) AS n FROM task' }, (r) => {
 	if (r.error) w.__error = r.error
