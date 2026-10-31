@@ -148,6 +148,10 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	}
 	pcfg.ConnConfig.RuntimeParams["TimeZone"] = "UTC"
 	pcfg.ConnConfig.RuntimeParams["DateStyle"] = "ISO, YMD"
+	// Restriction SQL quotes values as standard strings (rules.Literal),
+	// and pgx's simple protocol relies on it too: never let the server or
+	// a URL option turn it off.
+	pcfg.ConnConfig.RuntimeParams["standard_conforming_strings"] = "on"
 	pcfg.MaxConns = int32(cfg.Workers + 3)
 	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
@@ -1092,11 +1096,16 @@ func (e *Engine) prune() {
 			}
 		}
 	}
+	var idle []*Unit
 	for _, u := range e.units {
 		// A failing unit waits for its retry, not a result: it may go.
-		if u.holds <= 0 && !u.idleSince.IsZero() && u.idleSince.Before(cutoff) && (!u.inflight || u.failures > 0) {
+		droppable := u.holds <= 0 && !u.idleSince.IsZero() && (!u.inflight || u.failures > 0)
+		if droppable && u.idleSince.Before(cutoff) {
 			e.dropUnit(u)
 			continue
+		}
+		if droppable {
+			idle = append(idle, u)
 		}
 		keepFrom := e.start
 		if cur, ok := minCursor[u]; ok && cur < keepFrom {
@@ -1125,7 +1134,10 @@ func (e *Engine) prune() {
 		if j > 0 {
 			u.hist = slices.Clone(u.hist[j:])
 		}
-		u.histFrom = max(u.histFrom, keepFrom)
+		if keepFrom <= u.histFrom {
+			continue
+		}
+		u.histFrom = keepFrom
 		for c := range e.clients {
 			for _, h := range c.holds {
 				if h.u == u && h.delivered && c.cursor < u.histFrom {
@@ -1135,4 +1147,15 @@ func (e *Engine) prune() {
 			}
 		}
 	}
+	// Lingering units are a cache for reconnects: past maxIdleUnits the
+	// oldest go early.
+	if len(idle) > maxIdleUnits {
+		slices.SortFunc(idle, func(a, b *Unit) int { return a.idleSince.Compare(b.idleSince) })
+		for _, u := range idle[:len(idle)-maxIdleUnits] {
+			e.dropUnit(u)
+		}
+	}
 }
+
+// maxIdleUnits bounds the units kept in memory that no client holds.
+const maxIdleUnits = 10_000

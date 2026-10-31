@@ -18,7 +18,7 @@ import type { Bound, Principal, Rule } from './rules.ts'
 
 const REPO = path.resolve(import.meta.dirname, '../../..')
 const SECRET = 'harness-secret'
-const PORT = Number(process.env.LOCALSYNC_ENGINE_PORT ?? 3141)
+export const PORT = Number(process.env.LOCALSYNC_ENGINE_PORT ?? 3141)
 const DEBUG = !!process.env.HARNESS_DEBUG
 // LOCALSYNC_DRIFT_DUMP=1: dump client and engine members on drift, without
 // the debug logging (which changes timing enough to hide some races).

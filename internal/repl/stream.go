@@ -73,22 +73,23 @@ func Open(ctx context.Context, connString, slot, publication string) (*Stream, e
 	res, err := pglogrepl.CreateReplicationSlot(ctx, conn, slot, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Temporary: true, Mode: pglogrepl.LogicalReplication, SnapshotAction: "NOEXPORT_SNAPSHOT"})
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("create slot: %w", err)
 	}
 	start, err := pglogrepl.ParseLSN(res.ConsistentPoint)
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		return nil, err
 	}
 	err = pglogrepl.StartReplication(ctx, conn, slot, start, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{"proto_version '1'", fmt.Sprintf("publication_names '%s'", publication)},
 	})
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("start replication: %w", err)
 	}
 	s := &Stream{conn: conn, Txns: make(chan *Txn, 64), Start: uint64(start)}
+	// #nosec G118 -- run closes the connection with context.Background on purpose: ctx may be done by then.
 	go s.run(ctx)
 	return s, nil
 }

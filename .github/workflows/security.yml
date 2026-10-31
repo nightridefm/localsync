@@ -1,0 +1,28 @@
+# Known vulnerabilities and static analysis (scripts/security.sh without the
+# fuzzers, which want the compose Postgres and time). Weekly too, so a new
+# advisory for a dependency shows up without a code change.
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26.13.0
+      - run: SKIP_FUZZ=1 scripts/security.sh

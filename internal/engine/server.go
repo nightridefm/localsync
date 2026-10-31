@@ -145,6 +145,9 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	// Every way out closes the socket: the library leaves it open otherwise
+	// (an oversized message, say, stalls in the close handshake).
+	defer conn.CloseNow()
 	conn.SetReadLimit(1 << 20)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -164,12 +167,18 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 			return conn.Write(wctx, typ, m.data)
 		}
 		if e.writeLoop(ctx, c, write, nil, nil) {
-			conn.Close(websocket.StatusPolicyViolation, "closed by engine")
+			_ = conn.Close(websocket.StatusPolicyViolation, "closed by engine")
 		}
 	}()
 
+	// Until a WANT with a valid token arrives, reads share one deadline: a
+	// connection that never authenticates is closed, not kept alive by
+	// beats.
+	authCtx, authCancel := context.WithTimeout(ctx, authTimeout)
+	defer authCancel()
+	readCtx := authCtx
 	for {
-		typ, data, err := conn.Read(ctx)
+		typ, data, err := conn.Read(readCtx)
 		if err != nil {
 			return
 		}
@@ -187,6 +196,7 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 			e.Do(func() { c.fail("auth: " + err.Error()) })
 			continue
 		}
+		readCtx = ctx
 		e.Do(func() {
 			if !c.closed {
 				c.exp, c.grants = p.exp, p.grants
@@ -195,6 +205,10 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 }
+
+// authTimeout: how long a new WebSocket may stay open without a WANT that
+// carries a valid token.
+const authTimeout = 10 * time.Second
 
 // writeLoop writes the client's queued messages until the connection ends
 // (ctx), a write fails, the engine closes the client (it then flushes what
@@ -331,7 +345,13 @@ func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST a WANT", http.StatusMethodNotAllowed)
 		return
 	}
+	// The WANT must arrive promptly; the response may then stream for long.
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(authTimeout))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	// Cleared again: the server keeps reading in the background to notice
+	// the client going away, and an expired deadline would end the request.
+	_ = rc.SetReadDeadline(time.Time{})
 	var m wantMsg
 	if err == nil {
 		err = json.Unmarshal(body, &m)
@@ -348,7 +368,6 @@ func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Cache-Control", "no-store, no-transform")
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	rc := http.NewResponseController(w)
 	_ = rc.Flush()
 
 	ctx := r.Context()

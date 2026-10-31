@@ -110,17 +110,24 @@ func valueLen(c Column, b []byte) (int, error) {
 		}
 		return n, nil
 	case catalog.Float:
-		return 8, nil
+		return fixedLen(b, 8)
 	case catalog.Bool:
-		return 1, nil
+		return fixedLen(b, 1)
 	case catalog.UUID:
-		return 16, nil
+		return fixedLen(b, 16)
 	}
 	l, n := binary.Uvarint(b)
 	if n <= 0 || uint64(len(b)-n) < l {
 		return 0, errors.New("bad length")
 	}
 	return n + int(l), nil
+}
+
+func fixedLen(b []byte, n int) (int, error) {
+	if len(b) < n {
+		return 0, errors.New("short value")
+	}
+	return n, nil
 }
 
 // Patch is a decoded PATCH op.
@@ -162,7 +169,7 @@ func DecodePatch(cols []Column, b []byte) (*Patch, error) {
 	}
 	p := &Patch{Hash: binary.LittleEndian.Uint64(b), Changed: make([]bool, n), Vals: make([][]byte, n)}
 	l, k := binary.Uvarint(b[8:])
-	if k <= 0 {
+	if k <= 0 || l > uint64(len(b)-8-k) {
 		return nil, errors.New("bad patch pk")
 	}
 	pos := 8 + k

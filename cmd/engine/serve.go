@@ -43,7 +43,9 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: e.Handler()}
+	// No ReadTimeout or WriteTimeout: /sync responses and sockets are long
+	// lived (the handlers set their own deadlines). Headers must be prompt.
+	srv := &http.Server{Handler: e.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	go func() { _ = srv.Serve(ln) }()
 	slog.Info("listening", "addr", ln.Addr().String())
 	err = e.Run(ctx)

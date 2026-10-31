@@ -787,6 +787,27 @@ so changed claims revoke or add units through the normal frame path. The
 engine is the only place visibility is decided; relays never interpret
 rules.
 
+Tokens are HS256 only, with `exp`, `sub` and the deployment's `aud`
+required (`alg: none`, other algorithms and string `grants` are refused).
+`$sub` always comes from the token: a client parameter named like an
+undeclared one is refused. What an attacker can pin is bounded:
+
+| Limit | Value | Past it |
+| --- | --- | --- |
+| Time to a valid `WANT` (WebSocket), to the `WANT` body (HTTP) | 10 s | connection closed |
+| Message size | 1 MiB | connection closed |
+| Wants per connection | 2,000 | want refused |
+| New wants per connection | 4,000 at once, then 2,000 a minute | want refused, ask again later |
+| Parameter value | 4 KiB, no NUL | want refused |
+| Units no client holds (the resume cache) | 10,000 | oldest dropped early |
+| Bytes queued for one slow client | 64 MiB | connection closed |
+
+Client parameters reach Postgres through pgx's simple protocol and row
+values through `rules.Literal`; both depend on
+`standard_conforming_strings`, which the engine sets on every connection.
+`/debug/*`, `/metrics` and pprof share the listener: expose only `/sync`
+and `/sync/http` through the gateway.
+
 ## 12. Postgres footprint
 
 PG 18 only (both apps; App A upgrades from 17.4).
@@ -917,6 +938,24 @@ over `wss://` and `https://` exactly as browsers reach the apps.
 - **Browser**: `LOCALSYNC_BROWSER_VIA=gateway` (or `hostile`) serves the
   smoke and the collab soak from one `https://` origin through the
   gateway. All four cases pass, with 0 torn renders on aligned tabs.
+
+### 14.3a Hostile suite and security checks
+
+`pnpm --filter @nightride/localsync-harness hostile` attacks a running
+engine on purpose. Leak attacks are checked against the oracle:
+injection-shaped client parameters on every parameterised rule,
+injection-shaped principals (token `sub`) with text primary keys, and
+stored values that reach restriction SQL through a text join. Raw-socket
+attacks: forged and malformed tokens, undeclared parameters (`sub`),
+malformed, binary and oversized messages. Exhaustion attacks: 500
+connections that never authenticate, and one client churning through
+40,000 new units. After each, the engine must still answer `/health`.
+
+`scripts/security.sh` runs govulncheck, staticcheck, gosec and
+`pnpm audit`, then every Go fuzzer briefly (`FUZZTIME`): the wire codec
+and patch decoder, restriction SQL (row values must parse back as exactly
+those string constants) and client parameters through the simple protocol
+against Postgres. The tools are pinned in `tools/go.mod`.
 
 ### 14.4 Benchmarks
 

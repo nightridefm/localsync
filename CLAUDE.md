@@ -47,6 +47,8 @@ pnpm --filter @nightride/localsync-harness bench:fanout [--write]  # many client
 pnpm --filter @nightride/localsync-sim smash [--seed N] [--faults]
 pnpm --filter @nightride/localsync-sim parallel --jobs 5 --seeds 100-119 --faults  # one DB + engine per job
 pnpm --filter @nightride/localsync-browser smoke   # real localdb in headless Chrome via the transport
+pnpm --filter @nightride/localsync-harness hostile  # attacks: leaks, bad tokens, malformed input, exhaustion
+scripts/security.sh                                 # govulncheck, staticcheck, gosec, pnpm audit, fuzzers (FUZZTIME=20s)
 pnpm --filter @nightride/localsync-browser collab [--seconds 60]  # two people editing; torn renders and latency per tab
 docker compose --profile gateway up -d gateway      # TLS nginx like the apps' (docker/gateway/README.md; needs .env)
 pnpm --filter @nightride/localsync-harness gateway  # wss / https / auto / hostile-middlebox checks through it

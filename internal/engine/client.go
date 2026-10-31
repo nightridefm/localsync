@@ -67,6 +67,12 @@ type Client struct {
 	// synced: "synced" was sent for the current WANT (every hold delivered
 	// or failed). Reset by each WANT.
 	synced bool
+	// budget: new wants this client may still make (newWantBurst at most,
+	// refilled at newWantRate from budgetAt), so churning through wants
+	// cannot flood the database with snapshot queries or the engine with
+	// lingering units.
+	budget   float64
+	budgetAt time.Time
 }
 
 // Hold is a client's view of one unit: waiting for a snapshot, holding an
@@ -284,6 +290,18 @@ func (c *Client) sendJSON(v any) {
 // maxWants bounds the units one connection may hold.
 const maxWants = 2000
 
+// A connection may make newWantBurst new wants at once, then newWantRate a
+// second (a want the client already holds costs nothing). Well above what
+// navigating an app needs; a want over it is refused, and the client's next
+// WANT may ask again.
+const (
+	newWantBurst = 2 * maxWants
+	newWantRate  = maxWants / 60.0
+)
+
+// maxParamLen bounds a client parameter value (they are ids and keys).
+const maxParamLen = 4096
+
 // maxQueuedBytes bounds what one slow client can pin in engine memory.
 const maxQueuedBytes = 64 << 20
 
@@ -426,9 +444,12 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 			}
 			vals[i] = v
 		}
-		for name := range w.Params {
+		for name, v := range w.Params {
 			if !slices.Contains(a.Rule.ClientParams, name) {
 				bad = "unknown parameter " + name
+			} else if len(v) > maxParamLen || strings.IndexByte(v, 0) >= 0 {
+				// Postgres text cannot hold NUL; the query would only fail.
+				bad = "bad parameter " + name
 			}
 		}
 		if bad != "" {
@@ -445,6 +466,18 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 			e.release(h)
 			delete(c.holds, w.ID)
 		}
+		now := time.Now()
+		if c.budgetAt.IsZero() {
+			c.budget = newWantBurst
+		} else {
+			c.budget = min(newWantBurst, c.budget+now.Sub(c.budgetAt).Seconds()*newWantRate)
+		}
+		c.budgetAt = now
+		if c.budget < 1 {
+			errs = append(errs, wantErr{ID: w.ID, Error: "too many new wants; ask again later"})
+			continue
+		}
+		c.budget--
 		h := &Hold{c: c, id: w.ID, key: key, rule: w.Rule}
 		if sr := e.shared[a]; sr != nil {
 			// One body per non-principal parameters, gates per principal.
