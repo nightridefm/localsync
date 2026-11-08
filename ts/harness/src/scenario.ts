@@ -13,7 +13,7 @@ import { type Bound, bind, type Principal, type Rule, type Want } from './rules.
 
 export class Fail extends Error {}
 
-export type Result = { status: 'pass' | 'fail' | 'unsupported' | 'error'; note: string; ms: number }
+export type Result = { status: 'pass' | 'fail' | 'error'; note: string; ms: number }
 
 export type Scenario = { id: string; title: string; run(ctx: Ctx): Promise<string | void> }
 
@@ -117,7 +117,7 @@ export class Ctx {
 
 	addRule(rule: Rule): void {
 		this.rules.set(rule.name, rule)
-		this.adapter.registerRule?.(rule)
+		this.adapter.registerRule(rule)
 	}
 
 	rule(name: string): Rule {

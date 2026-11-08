@@ -1,5 +1,6 @@
 // Package catalog introspects the Postgres catalog: tables, columns, primary
-// keys and function volatility, which rule analysis and the wire codec need.
+// keys, views and function volatility, which rule analysis and the wire
+// codec need.
 package catalog
 
 import (
@@ -69,8 +70,17 @@ func (t *Table) ColumnIndex(name string) int {
 	return i
 }
 
+// View is a view's definition. Rule analysis expands views into their
+// definitions, so the engine only ever reads tables.
+type View struct {
+	SQL string // pg_get_viewdef
+	// Barrier: security_barrier, whose protection inlining would drop.
+	Barrier bool
+}
+
 type Catalog struct {
 	Tables map[string]*Table // by name, public schema
+	Views  map[string]View   // by name, public schema
 	// Volatility of functions by name: 'i', 's' or 'v' (the most volatile
 	// overload wins).
 	Volatility map[string]byte
@@ -114,7 +124,7 @@ type Querier interface {
 
 // Load reads the public schema.
 func Load(ctx context.Context, q Querier) (*Catalog, error) {
-	c := &Catalog{Tables: map[string]*Table{}, Volatility: map[string]byte{}}
+	c := &Catalog{Tables: map[string]*Table{}, Views: map[string]View{}, Volatility: map[string]byte{}}
 	rows, err := q.Query(ctx, `
 		SELECT c.relname, a.attname, t.typname, t.typcategory,
 		       COALESCE(e.typname, ''), COALESCE(e.typcategory, ''),
@@ -167,6 +177,26 @@ func Load(ctx context.Context, q Querier) (*Catalog, error) {
 	}
 	for name, pk := range pkPos {
 		c.Tables[name].PK = pk
+	}
+	vrows, err := q.Query(ctx, `
+		SELECT c.relname, pg_get_viewdef(c.oid),
+		       COALESCE((SELECT o.option_value::bool FROM pg_options_to_table(c.reloptions) o
+		                 WHERE o.option_name = 'security_barrier'), false)
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relkind = 'v'`)
+	if err != nil {
+		return nil, err
+	}
+	for vrows.Next() {
+		var name string
+		var v View
+		if err := vrows.Scan(&name, &v.SQL, &v.Barrier); err != nil {
+			return nil, err
+		}
+		c.Views[name] = v
+	}
+	if err := vrows.Err(); err != nil {
+		return nil, err
 	}
 	frows, err := q.Query(ctx, `SELECT proname, max(provolatile) FROM pg_proc GROUP BY proname`)
 	if err != nil {

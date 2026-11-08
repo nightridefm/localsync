@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -39,6 +38,17 @@ type Config struct {
 	Window      time.Duration
 	Workers     int
 	Publication string
+
+	// Switches for optimisations. Each is a cache or shortcut over the core
+	// (docs/design.md section 8): with it off the engine computes the same
+	// result the slow way. `engine serve` sets them from LOCALSYNC_<NAME>=0.
+	NoSplit       bool // LOCALSYNC_SPLIT: gates evaluated as subqueries, not units
+	NoSnapCache   bool // LOCALSYNC_SNAP_CACHE: every join runs a snapshot query
+	NoEqualSkip   bool // LOCALSYNC_EQUAL_SKIP: resend units whose checksum matches
+	NoCompression bool // LOCALSYNC_WS_COMPRESSION: no permessage-deflate
+	// Verify (LOCALSYNC_VERIFY=1): after every resolution, re-evaluate the
+	// unit and log any difference from its incremental state.
+	Verify bool
 }
 
 type metrics struct {
@@ -57,12 +67,12 @@ type stats struct {
 	cacheHits       int // snapshots served from the cache instead
 }
 
-type sharedRule struct {
+type splitRule struct {
 	body  *rules.Analysis
-	gates []sharedGate
+	gates []splitGate
 }
 
-type sharedGate struct {
+type splitGate struct {
 	a   *rules.Analysis
 	neg bool
 }
@@ -79,54 +89,62 @@ type txnRec struct {
 }
 
 type Engine struct {
-	cfg   Config
-	pool  *pgxpool.Pool
-	cat   *catalog.Catalog
-	epoch string
-
-	analyses map[string]*rules.Analysis
-	// shared: wantable rules served from a shared body plus per-principal
-	// gate units (rules.Share). The derived analyses route like any other
-	// but are never wantable themselves.
-	shared  map[*rules.Analysis]*sharedRule
-	byTable map[string][]*rules.Analysis
-	byDep   map[string][]depRef
-	units   map[string]*Unit
-	byRule  map[*rules.Analysis]map[*Unit]struct{}
-	nextRef uint32
+	cfg     Config
+	pool    *pgxpool.Pool
 	clients map[*Client]struct{}
+	nextRef uint32
+	budgets map[string]*unitBudget // by principal (spend)
 
-	head uint64
-	// ringXid indexes ring commits by (32-bit) xid, for boundary().
-	ringXid map[uint32]uint64
-	// headEnd is the end of the last routed commit record. A query whose
-	// snapshot LSN is at or before it cannot have missed a commit: every
-	// WAL record before that point has been streamed (no fence needed).
-	headEnd uint64
-	start   uint64
-	ring    []txnRec
-	// relMap caches relation column order -> catalog column index.
-	relMap map[uint32][]int
+	// epochState is everything tied to one replication slot. All of it is
+	// a cache (docs/design.md section 2): setup replaces it whole.
+	epochState
 
-	stream  *repl.Stream
-	results chan *query
-	work    chan job
-	// next collects queries for the next snapshot round; one round runs at
-	// a time and every query in it shares one exported snapshot, so units
-	// resolved together share their boundary B.
-	next      []*query
-	roundBusy bool
+	results   chan *query
+	work      chan job
 	requests  chan func()
-	waiting   []*query // results waiting for the stream to pass lsnS
-	// delayed are retries of failed queries, run at their unit's retryAt.
-	delayed  []*query
-	stats    *stats
-	restarts int // in-process restarts after a lost replication stream
+	roundBusy bool
+	stats     *stats
+	restarts  int // in-process restarts after a lost replication stream
 	// m is for /metrics: monotonic across in-process restarts (stats is
 	// per epoch). Loop-owned, except the atomics the writers add to.
 	m       metrics
 	fencing bool
 	fenceAt time.Time
+}
+
+type epochState struct {
+	epoch  string // random id per slot; clients' haves name it
+	stream *repl.Stream
+	cat    *catalog.Catalog
+
+	analyses map[string]*rules.Analysis
+	// splits: wantable rules served as a body unit plus gate units
+	// (rules.Split). The derived analyses route like any other but are
+	// never wantable themselves.
+	splits  map[*rules.Analysis]*splitRule
+	byTable map[string][]*rules.Analysis
+	byDep   map[string][]depRef
+	units   map[string]*Unit
+	byRule  map[*rules.Analysis]map[*Unit]struct{}
+
+	start, head uint64
+	// headEnd is the end of the last routed commit record. A query whose
+	// snapshot LSN is at or before it cannot have missed a commit: every
+	// WAL record before that point has been streamed (no fence needed).
+	headEnd uint64
+	ring    []txnRec
+	// ringXid indexes ring commits by (32-bit) xid, for boundary().
+	ringXid map[uint32]uint64
+	// relMap caches relation column order -> catalog column index.
+	relMap map[uint32][]int
+
+	// next collects queries for the next snapshot round; one round runs at
+	// a time and every query in it shares one exported snapshot, so units
+	// resolved together share their boundary B.
+	next    []*query
+	waiting []*query // results waiting for the stream to pass lsnS
+	// delayed are retries of failed queries, run at their unit's retryAt.
+	delayed []*query
 }
 
 func New(ctx context.Context, cfg Config) (*Engine, error) {
@@ -157,12 +175,8 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	var b [8]byte
-	_, _ = rand.Read(b[:])
 	e := &Engine{
-		cfg: cfg, pool: pool, epoch: hex.EncodeToString(b[:]),
-		units: map[string]*Unit{}, byRule: map[*rules.Analysis]map[*Unit]struct{}{},
-		clients: map[*Client]struct{}{}, relMap: map[uint32][]int{}, ringXid: map[uint32]uint64{},
+		cfg: cfg, pool: pool, clients: map[*Client]struct{}{}, budgets: map[string]*unitBudget{},
 		results: make(chan *query, 1024), work: make(chan job, 1024), requests: make(chan func(), 1024),
 	}
 	if err := e.setup(ctx); err != nil {
@@ -172,9 +186,17 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	return e, nil
 }
 
-// setup loads the catalog and rules, installs the sync schema, manages the
-// publication and replica identity, and opens the replication stream.
+// setup starts an epoch: it loads the catalog and rules, installs the sync
+// schema, manages the publication and replica identity, and opens a new
+// replication slot. The previous epoch's state, if any, is dropped whole.
 func (e *Engine) setup(ctx context.Context) error {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	e.epochState = epochState{
+		epoch: hex.EncodeToString(b[:]),
+		units: map[string]*Unit{}, byRule: map[*rules.Analysis]map[*Unit]struct{}{},
+		relMap: map[uint32][]int{}, ringXid: map[uint32]uint64{},
+	}
 	if _, err := e.pool.Exec(ctx, `
 		CREATE SCHEMA IF NOT EXISTS sync;
 		CREATE TABLE IF NOT EXISTS sync.fence (id int PRIMARY KEY, n bigint NOT NULL);
@@ -189,8 +211,8 @@ func (e *Engine) setup(ctx context.Context) error {
 	e.analyses = map[string]*rules.Analysis{}
 	e.byTable = map[string][]*rules.Analysis{}
 	e.byDep = map[string][]depRef{}
+	e.splits = map[*rules.Analysis]*splitRule{}
 	tables := map[string]bool{}
-	e.shared = map[*rules.Analysis]*sharedRule{}
 	register := func(a *rules.Analysis) {
 		e.byTable[a.Table.Name] = append(e.byTable[a.Table.Name], a)
 		for i := range a.Occurrences {
@@ -207,16 +229,20 @@ func (e *Engine) setup(ctx context.Context) error {
 			return fmt.Errorf("rule %s: %w", r.Name, err)
 		}
 		e.analyses[r.Name] = a
-		register(a)
-		sr := e.shareRule(ctx, a, cat)
-		if sr != nil {
-			e.shared[a] = sr
-			register(sr.body)
-			for _, g := range sr.gates {
-				register(g.a)
-			}
+		// A split rule is served by its body and gate units only; its own
+		// analysis is for access checks.
+		sr := e.splitOf(ctx, a, cat)
+		if sr == nil {
+			register(a)
+			slog.Info("rule", "name", r.Name, "table", a.Table.Name, "tier", a.Tier, "fast", a.Fast, "deps", a.Deps)
+			continue
 		}
-		slog.Info("rule", "name", r.Name, "table", a.Table.Name, "tier", a.Tier, "fast", a.Fast, "deps", a.Deps, "shared", sr != nil)
+		e.splits[a] = sr
+		register(sr.body)
+		for _, g := range sr.gates {
+			register(g.a)
+		}
+		slog.Info("rule", "name", r.Name, "table", a.Table.Name, "tier", sr.body.Tier, "fast", sr.body.Fast, "deps", a.Deps, "gates", len(sr.gates))
 	}
 	names := []string{"sync.fence"}
 	for t := range tables {
@@ -225,8 +251,8 @@ func (e *Engine) setup(ctx context.Context) error {
 	// REPLICA IDENTITY FULL only where old values are read: tables inside
 	// some rule's subqueries (restriction values, column pruning). A rule's
 	// own table does not need it (units keep per-column hashes), and FULL
-	// logs the whole detoasted old row on every update (design Q1). Never
-	// downgrade: another consumer (Electric during migration) may need FULL.
+	// logs the whole detoasted old row on every update. Never
+	// downgrade: another consumer of the table may need FULL.
 	for t := range e.byDep {
 		var ident string
 		if err := e.pool.QueryRow(ctx, "SELECT relreplident::text FROM pg_class WHERE oid = $1::regclass", rules.Ident(t)).Scan(&ident); err != nil {
@@ -262,18 +288,18 @@ func (e *Engine) setup(ctx context.Context) error {
 	return nil
 }
 
-// shareRule turns a rule's sharing proposal into analyses, or returns nil
+// splitOf turns a rule's sharing proposal into analyses, or returns nil
 // (the rule stays per principal) when any derived rule fails analysis or
 // Postgres refuses it (an unqualified name in a gate that resolves to the
 // outer table would change meaning once the gate stands alone).
-func (e *Engine) shareRule(ctx context.Context, a *rules.Analysis, cat *catalog.Catalog) *sharedRule {
-	if a.Share == nil || os.Getenv("LOCALSYNC_SHARE") == "0" {
+func (e *Engine) splitOf(ctx context.Context, a *rules.Analysis, cat *catalog.Catalog) *splitRule {
+	if a.Split == nil || e.cfg.NoSplit {
 		return nil
 	}
 	check := func(r rules.Rule) *rules.Analysis {
 		d, err := rules.Analyze(r, cat)
 		if err != nil {
-			slog.Info("rule not shared", "rule", a.Rule.Name, "derived", r.Name, "err", err)
+			slog.Info("rule not split", "rule", a.Rule.Name, "derived", r.Name, "err", err)
 			return nil
 		}
 		conn, err := e.pool.Acquire(ctx)
@@ -282,21 +308,21 @@ func (e *Engine) shareRule(ctx context.Context, a *rules.Analysis, cat *catalog.
 		}
 		defer conn.Release()
 		if _, err := conn.Conn().Prepare(ctx, "", d.SQL); err != nil {
-			slog.Info("rule not shared", "rule", a.Rule.Name, "derived", r.Name, "err", err)
+			slog.Info("rule not split", "rule", a.Rule.Name, "derived", r.Name, "err", err)
 			return nil
 		}
 		return d
 	}
-	sr := &sharedRule{body: check(a.Share.Body)}
+	sr := &splitRule{body: check(a.Split.Body)}
 	if sr.body == nil {
 		return nil
 	}
-	for _, g := range a.Share.Gates {
+	for _, g := range a.Split.Gates {
 		d := check(g.Rule)
 		if d == nil {
 			return nil
 		}
-		sr.gates = append(sr.gates, sharedGate{a: d, neg: g.Negated})
+		sr.gates = append(sr.gates, splitGate{a: d, neg: g.Negated})
 	}
 	return sr
 }
@@ -349,19 +375,15 @@ func (e *Engine) Run(ctx context.Context) error {
 }
 
 // restart recovers from a lost replication stream inside the process, the
-// same way a process restart would but without dropping client sockets:
-// engine state is a cache (design A2), so it is thrown away, a new slot is
-// opened under a new epoch, and every client is asked to send its WANT
-// again. That WANT carries the old epoch, so it reconciles by checksum
-// exactly like a reconnect. Retries with backoff until ctx ends.
+// same way a process restart would: engine state is a cache, so it is
+// thrown away, a new slot is opened under a new epoch, and every client
+// connection is closed cleanly, so clients reconnect at once. Retries with
+// backoff until ctx ends.
 func (e *Engine) restart(ctx context.Context, cause error) error {
 	slog.Warn("replication stream lost; restarting in process", "err", cause)
 	e.restarts++
 	backoff := 250 * time.Millisecond
 	for {
-		var b [8]byte
-		_, _ = rand.Read(b[:])
-		e.epoch = hex.EncodeToString(b[:])
 		err := e.setup(ctx)
 		if err == nil {
 			break
@@ -376,25 +398,11 @@ func (e *Engine) restart(ctx context.Context, cause error) error {
 	}
 	// Queries still running belong to the old units; their results are
 	// dropped (resolveWaiting and apply check that the unit is current).
-	// roundBusy and fencing clear themselves when those finish.
-	e.units = map[string]*Unit{}
-	e.byRule = map[*rules.Analysis]map[*Unit]struct{}{}
-	e.ring = nil
-	e.ringXid = map[uint32]uint64{}
-	e.relMap = map[uint32][]int{}
-	e.next = nil
-	e.waiting = nil
-	e.delayed = nil
+	// roundBusy and fencing clear themselves when those finish. Clients
+	// reconnect, and their WANTs carry the old epoch, so they reconcile by
+	// checksum like any reconnect.
 	for c := range e.clients {
-		c.holds = nil
-		c.cursor = 0
-		c.removals = nil
-		c.stream = nil
-		c.forceFrame = false
-		c.synced = false
-		// A frame cut short by this is never completed; the client drops
-		// its buffered parts on this message.
-		c.sendJSON(map[string]any{"type": "resync", "epoch": e.epoch})
+		c.end()
 	}
 	slog.Info("restarted", "epoch", e.epoch, "clients", len(e.clients))
 	return nil
@@ -570,8 +578,7 @@ func (e *Engine) schedule() {
 			q.full = true
 		}
 		if u.a.Fast {
-			// Fast units go pending on gate or TRUNCATE changes, and on
-			// fetches (a row entering with an unsent TOAST value). They buffer
+			// Fast units go pending on TRUNCATE and on fetches (a row entering with an unsent TOAST value). They buffer
 			// their own changes meanwhile, which only a whole-unit evaluation
 			// covers, so their queries are always full.
 			q.full = true
@@ -700,7 +707,7 @@ func (e *Engine) resolveWaiting() {
 }
 
 func (e *Engine) retry(q *query, full bool) {
-	n := &query{u: q.u, full: full || q.full, forHolds: q.forHolds, restr: q.restr, maxLSN: q.maxLSN}
+	n := &query{u: q.u, full: full || q.full, use: q.use, restr: q.restr, maxLSN: q.maxLSN}
 	e.next = append(e.next, n)
 }
 
@@ -709,7 +716,7 @@ func (e *Engine) resolve(q *query) {
 	if e.units[u.key] != u {
 		return // dropped meanwhile
 	}
-	if q.verify {
+	if q.use == forVerify {
 		e.verifyResult(q)
 		return
 	}
@@ -719,15 +726,13 @@ func (e *Engine) resolve(q *query) {
 	}
 	u.failures, u.err = 0, ""
 	b, regular := e.boundary(q)
-	if os.Getenv("LOCALSYNC_DEBUG") != "" {
-		slog.Info("resolve", "unit", u.key[:min(len(u.key), 40)], "full", q.full, "forHolds", q.forHolds, "b", b, "regular", regular,
-			"lsnS", q.lsnS, "head", e.head, "headEnd", e.headEnd, "maxLSN", q.maxLSN, "rows", len(q.res), "xmin", q.snap.xmin, "xmax", q.snap.xmax, "xip", len(q.snap.xip))
-	}
-	if !regular || b < q.maxLSN || (u.state == creating && !q.forHolds && b < u.regHead) {
+	slog.Debug("resolve", "unit", u.key[:min(len(u.key), 40)], "full", q.full, "use", q.use, "b", b, "regular", regular,
+		"lsnS", q.lsnS, "head", e.head, "headEnd", e.headEnd, "maxLSN", q.maxLSN, "rows", len(q.res), "xmin", q.snap.xmin, "xmax", q.snap.xmax, "xip", len(q.snap.xip))
+	if !regular || b < q.maxLSN || (u.state == creating && q.use != forHolds && b < u.regHead) {
 		e.retry(q, false)
 		return
 	}
-	if q.forHolds {
+	if q.use == forHolds {
 		e.resolveSnapshot(q, b)
 		return
 	}
@@ -746,8 +751,8 @@ func (e *Engine) resolve(q *query) {
 		}
 	}
 	e.apply(q, b)
-	if verifyMode && !q.verify {
-		e.next = append(e.next, &query{u: u, full: true, verify: true})
+	if e.cfg.Verify {
+		e.next = append(e.next, &query{u: u, full: true, use: forVerify})
 	}
 }
 
@@ -769,7 +774,7 @@ func (e *Engine) failed(q *query) {
 	slog.Error("query failed", "unit", u.key, "failures", u.failures, "retry_in", backoff, "err", q.err)
 	// The retry is a whole-unit evaluation: it covers every restriction
 	// pending by then, however many arrived meanwhile.
-	e.delayed = append(e.delayed, &query{u: u, full: true, forHolds: q.forHolds})
+	e.delayed = append(e.delayed, &query{u: u, full: true, use: q.use})
 }
 
 // retryDue moves failed queries whose time has come to the next round.
@@ -788,11 +793,9 @@ func (e *Engine) retryDue() {
 	e.delayed = keep
 }
 
-// verifyMode (LOCALSYNC_VERIFY): after every resolution, re-evaluate the
-// unit and compare with its own state, logging any difference. A
-// differential check of the incremental paths against the definition.
-var verifyMode = os.Getenv("LOCALSYNC_VERIFY") != ""
-
+// verifyResult compares a whole-unit evaluation with the unit's own state
+// (Config.Verify): a differential check of the incremental paths against
+// the definition.
 func (e *Engine) verifyResult(q *query) {
 	u := q.u
 	if e.units[u.key] != u || q.err != nil || u.state != ready {
@@ -805,10 +808,8 @@ func (e *Engine) verifyResult(q *query) {
 		return
 	}
 	want := map[string]uint64{}
-	if q.gateOK {
-		for _, r := range q.res {
-			want[r.key] = rowSum(r.hashes)
-		}
+	for _, r := range q.res {
+		want[r.key] = rowSum(r.hashes)
 	}
 	var bad []string
 	for key, hs := range u.members {
@@ -841,14 +842,11 @@ func (e *Engine) apply(q *query, b uint64) {
 	if len(u.pending) > 0 {
 		gapFrom = u.pending[0].lsn - 1
 	}
-	u.gateOK = q.gateOK
 	if q.full {
 		seen := make(map[string]bool, len(q.res))
-		if q.gateOK {
-			for _, r := range q.res {
-				seen[r.key] = true
-				u.putRow(r.key, r.row, r.hashes)
-			}
+		for _, r := range q.res {
+			seen[r.key] = true
+			u.putRow(r.key, r.row, r.hashes)
 		}
 		for key := range u.members {
 			if !seen[key] {
@@ -907,13 +905,8 @@ func (e *Engine) apply(q *query, b uint64) {
 // ---- holds and snapshots ----
 
 // snapshotWaiters hands a fresh full result at b to holds waiting on u.
+// Creation results are cached even when no client waits.
 func (e *Engine) snapshotWaiters(u *Unit, b uint64, q *query) {
-	if len(u.waiters) == 0 {
-		// Creation results are cached even when no client waits.
-		ops, sum := snapshotOps(u, q)
-		e.cacheSnapshot(u, b, ops, sum)
-		return
-	}
 	ops, sum := snapshotOps(u, q)
 	e.cacheSnapshot(u, b, ops, sum)
 	for _, h := range u.waiters {
@@ -924,14 +917,11 @@ func (e *Engine) snapshotWaiters(u *Unit, b uint64, q *query) {
 		}
 		h.setSnapshot(b, ops, sum)
 	}
-	u.waiters = slices.DeleteFunc(u.waiters, func(h *Hold) bool { return !h.snapPending })
+	u.waiters = slices.DeleteFunc(u.waiters, func(h *Hold) bool { return h.phase != holdWaiting })
 }
 
 // snapshotOps turns a full result into PUT ops sharing its encoded rows.
 func snapshotOps(u *Unit, q *query) ([]opRec, uint64) {
-	if !q.gateOK {
-		return nil, 0
-	}
 	ops := make([]opRec, len(q.res))
 	var sum uint64
 	for i, r := range q.res {
@@ -952,7 +942,7 @@ func (e *Engine) resolveSnapshot(q *query, b uint64) {
 	e.snapshotWaiters(u, b, q)
 	if len(u.waiters) > 0 && !u.snapIn {
 		u.snapIn = true
-		e.next = append(e.next, &query{u: u, full: true, forHolds: true})
+		e.next = append(e.next, &query{u: u, full: true, use: forHolds})
 	}
 }
 
@@ -967,7 +957,7 @@ func (e *Engine) requestSnapshot(h *Hold) {
 		u.waiters = slices.DeleteFunc(u.waiters, func(x *Hold) bool { return x == h })
 		return
 	}
-	h.snapPending = true
+	h.phase = holdWaiting
 	if !slices.Contains(u.waiters, h) {
 		u.waiters = append(u.waiters, h)
 	}
@@ -977,7 +967,7 @@ func (e *Engine) requestSnapshot(h *Hold) {
 	u.snapIn = true
 	e.stats.snapshotQueries++
 	e.m.snapshotQueries++
-	e.next = append(e.next, &query{u: u, full: true, forHolds: true})
+	e.next = append(e.next, &query{u: u, full: true, use: forHolds})
 }
 
 // cachedSnap is a unit's most recent full snapshot, kept briefly so clients
@@ -996,11 +986,8 @@ const (
 	snapCacheBudget = 256 << 20
 )
 
-// LOCALSYNC_SNAP_CACHE=0 turns the cache off (A/B measurements, safety valve).
-var snapCacheOff = os.Getenv("LOCALSYNC_SNAP_CACHE") == "0"
-
 func (e *Engine) cacheSnapshot(u *Unit, b uint64, ops []opRec, sum uint64) {
-	if snapCacheOff || u.snap != nil && u.snap.b >= b {
+	if e.cfg.NoSnapCache || u.snap != nil && u.snap.b >= b {
 		return
 	}
 	u.snap = &cachedSnap{b: b, ops: ops, sum: sum, at: time.Now(), bytes: opBytes(ops)}
@@ -1069,9 +1056,16 @@ func (e *Engine) fenceIfNeeded() {
 // maxHistBytes bounds the history one unit keeps for catch-up.
 const maxHistBytes = 32 << 20
 
-// prune drops history no client needs and old ring entries.
+// prune drops history no client needs, old ring entries, and budgets that
+// have refilled.
 func (e *Engine) prune() {
-	cutoff := time.Now().Add(-e.cfg.Window)
+	now := time.Now()
+	for sub, b := range e.budgets {
+		if b.left+now.Sub(b.at).Seconds()*newUnitRate >= newUnitBurst {
+			delete(e.budgets, sub)
+		}
+	}
+	cutoff := now.Add(-e.cfg.Window)
 	i := 0
 	for i < len(e.ring) && e.ring[i].at.Before(cutoff) {
 		i++
@@ -1140,8 +1134,8 @@ func (e *Engine) prune() {
 		u.histFrom = keepFrom
 		for c := range e.clients {
 			for _, h := range c.holds {
-				if h.u == u && h.delivered && c.cursor < u.histFrom {
-					h.delivered = false
+				if h.u == u && h.delivered() && c.cursor < u.histFrom {
+					h.phase = holdWaiting
 					e.requestSnapshot(h)
 				}
 			}

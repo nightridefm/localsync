@@ -124,8 +124,27 @@ void test('a unit removed while a WANT for it again is in flight keeps its check
 	)
 	assert.deepEqual(next.drift, [], next.why.join('; '))
 	assert.deepEqual(db.all('SELECT id FROM task ORDER BY id'), [['a1'], ['a2'], ['a3']])
-	assert.deepEqual(db.all('SELECT id, held FROM _lsync_unit ORDER BY id'), [
+	// A claims its checksum on the next WANT; B, dropped, claims nothing.
+	assert.deepEqual(db.all('SELECT id, checksum IS NOT NULL FROM _lsync_unit ORDER BY id'), [
 		[1, 1],
 		[2, 0],
 	])
+})
+
+test('a database synced before _lsync_table migrates in place, keeping unit ids', () => {
+	const db = sqlite()
+	db.exec(`CREATE TABLE _lsync_unit (
+		id INTEGER PRIMARY KEY, def TEXT NOT NULL UNIQUE, checksum TEXT NOT NULL DEFAULT '0',
+		held INTEGER NOT NULL DEFAULT 0, drift INTEGER NOT NULL DEFAULT 0, tbl TEXT, pk_cols TEXT)`)
+	db.exec(`INSERT INTO _lsync_unit VALUES
+		(1, 'held', '11', 1, 0, 'task', '["id"]'),
+		(2, 'drifted', '22', 1, 1, 'task', '["id"]'),
+		(3, 'dropped', '0', 0, 0, NULL, NULL)`)
+	new Applier().ensureSchema(db)
+	assert.deepEqual(db.all('SELECT id, def, checksum FROM _lsync_unit ORDER BY id'), [
+		[1, 'held', '11'],
+		[2, 'drifted', null],
+		[3, 'dropped', null],
+	])
+	assert.deepEqual(db.all('SELECT tbl, pk_cols FROM _lsync_table'), [['task', '["id"]']])
 })

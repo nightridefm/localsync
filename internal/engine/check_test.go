@@ -26,15 +26,16 @@ func TestCheck(t *testing.T) {
 	}
 	for _, c := range []struct {
 		name, sql string
-		shared    bool
+		split     bool
 		fails     string
 	}{
-		// $sub in the rows and a client parameter, so not shared, with a
-		// gate reading $sub alone: v0.1.0 bound every parameter to the gate
-		// and pgx refused ("unused argument").
-		{name: "sub rows, gate on a subset", sql: `SELECT * FROM check_item WHERE owner = $sub AND project = $project AND EXISTS (SELECT 1 FROM check_user WHERE id = $sub AND active)`},
-		{name: "gate on the client parameter alone", sql: `SELECT * FROM check_item WHERE owner = $sub AND EXISTS (SELECT 1 FROM check_item WHERE project = $project)`},
-		{name: "shared body", sql: `SELECT * FROM check_item WHERE project = $project AND EXISTS (SELECT 1 FROM check_user WHERE id = $sub AND active)`, shared: true},
+		// $sub in the rows and a client parameter, with a gate reading $sub
+		// alone: each derived rule binds only its own parameters (pgx
+		// refuses an unused argument).
+		{name: "sub rows, gate on a subset", sql: `SELECT * FROM check_item WHERE owner = $sub AND project = $project AND EXISTS (SELECT 1 FROM check_user WHERE id = $sub AND active)`, split: true},
+		{name: "gate on the client parameter alone", sql: `SELECT * FROM check_item WHERE owner = $sub AND EXISTS (SELECT 1 FROM check_item WHERE project = $project)`, split: true},
+		{name: "body shared across principals", sql: `SELECT * FROM check_item WHERE project = $project AND EXISTS (SELECT 1 FROM check_user WHERE id = $sub AND active)`, split: true},
+		{name: "no gate", sql: `SELECT * FROM check_item WHERE owner = $sub AND project = $project`},
 		// Accepted by analysis, fails only when run.
 		{name: "run-time failure", sql: `SELECT * FROM check_item WHERE owner = $sub AND project = $project AND EXISTS (SELECT 1 FROM check_user WHERE 1 / (SELECT count(*)::int * 0 FROM check_user) = 1)`, fails: "division by zero"},
 	} {
@@ -43,7 +44,7 @@ func TestCheck(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			shared, err := Check(ctx, pool, cat, a)
+			body, err := Check(ctx, pool, cat, a)
 			if c.fails != "" {
 				if err == nil || !strings.Contains(err.Error(), c.fails) {
 					t.Fatalf("want an error with %q, got %v", c.fails, err)
@@ -53,8 +54,8 @@ func TestCheck(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if shared != c.shared {
-				t.Errorf("shared = %v, want %v", shared, c.shared)
+			if (body != nil) != c.split {
+				t.Errorf("split = %v, want %v", body != nil, c.split)
 			}
 		})
 	}

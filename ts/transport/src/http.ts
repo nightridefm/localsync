@@ -12,21 +12,21 @@ export const REC_TEXT = 0
 export const REC_BINARY = 1
 export const REC_DEFLATED = 0x80
 
-/** A connection to the engine, as SyncClient uses it (WebSocket-shaped). */
+/**
+ * A connection to the engine, as SyncClient uses it (WebSocket-shaped). It
+ * carries one WANT: a new WANT is a new connection.
+ */
 export type Conn = {
-	/** HTTP: one WANT per connection; a new WANT needs a new one. */
-	readonly oneShot: boolean
 	readonly open: boolean
 	send(data: string): void
 	close(): void
 	onopen: (() => void) | null
 	onmessage: ((data: string | ArrayBuffer) => void) | null
-	/** clean: the engine ended it (HTTP: reconnect at once, no backoff). */
+	/** clean: the engine ended it on purpose (reconnect at once, no backoff). */
 	onclose: ((clean: boolean) => void) | null
 }
 
 export class WsConn implements Conn {
-	readonly oneShot = false
 	onopen: (() => void) | null = null
 	onmessage: ((data: string | ArrayBuffer) => void) | null = null
 	onclose: ((clean: boolean) => void) | null = null
@@ -37,7 +37,8 @@ export class WsConn implements Conn {
 		ws.binaryType = 'arraybuffer'
 		ws.onopen = () => this.onopen?.()
 		ws.onmessage = (ev: MessageEvent) => this.onmessage?.(ev.data as string | ArrayBuffer)
-		ws.onclose = () => this.onclose?.(false)
+		// 1000: the engine closed it on purpose (a restart); reconnect now.
+		ws.onclose = (ev: CloseEvent) => this.onclose?.(ev.code === 1000)
 		ws.onerror = () => {}
 		this.ws = ws
 	}
@@ -65,7 +66,6 @@ const inflate = async (b: Uint8Array): Promise<ArrayBuffer> =>
 const utf8 = new TextDecoder()
 
 export class HttpConn implements Conn {
-	readonly oneShot = true
 	onopen: (() => void) | null = null
 	onmessage: ((data: string | ArrayBuffer) => void) | null = null
 	onclose: ((clean: boolean) => void) | null = null

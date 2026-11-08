@@ -28,7 +28,7 @@ func TestSnapshotVisibility(t *testing.T) {
 }
 
 func TestBoundary(t *testing.T) {
-	e := &Engine{start: 10, ringXid: map[uint32]uint64{}}
+	e := &Engine{epochState: epochState{start: 10, ringXid: map[uint32]uint64{}}}
 	e.ring = []txnRec{{xid: 100, lsn: 20}, {xid: 101, lsn: 30}, {xid: 102, lsn: 40}, {xid: 103, lsn: 50}}
 	for _, t := range e.ring {
 		e.ringXid[t.xid] = t.lsn

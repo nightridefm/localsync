@@ -3,10 +3,14 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"check": "pnpm -r check",
+		"test": "go test -race ./... && pnpm -r --if-present test",
+		"check": "go vet ./... && pnpm -r check",
 		"lint": "oxlint --type-aware",
 		"format": "oxfmt",
-		"format:check": "oxfmt --check"
+		"format:check": "oxfmt --check",
+		"harness": "pnpm --filter @nightride/localsync-harness",
+		"sim": "pnpm --filter @nightride/localsync-sim",
+		"browser": "pnpm --filter @nightride/localsync-browser"
 	},
 	"devDependencies": {
 		"@types/node": "26.2.0",

@@ -12,29 +12,30 @@ import (
 	"github.com/nightridefm/localsync/internal/rules"
 )
 
+// queryUse is what a query's result is for.
+type queryUse uint8
+
+const (
+	forUnit   queryUse = iota // becomes the unit's state at its boundary
+	forHolds                  // a snapshot for waiting holds; the unit is unchanged
+	forVerify                 // compared with the unit's state, never applied (Config.Verify)
+	forProbe                  // engine plan (Check): run once, one row at most
+)
+
 // query is one spliced evaluation of a unit: the whole unit (full) or the
 // rows selected by a set of restrictions.
 type query struct {
-	u    *Unit
-	full bool
-	// forHolds: a snapshot for waiting holds only; the unit itself is not
-	// changed by the result.
-	forHolds bool
-	// verify (debug): a whole-unit evaluation compared against the unit's
-	// own state, never applied (LOCALSYNC_VERIFY).
-	verify bool
+	u      *Unit
+	full   bool
+	use    queryUse
 	restr  []restriction
 	maxLSN uint64 // largest LSN among restrictions included
-	// probe (engine plan, Check): run the body even behind a closed gate,
-	// one row at most.
-	probe bool
 
 	// results
-	snap   snapshot
-	lsnS   uint64
-	res    []resultRow
-	gateOK bool
-	err    error
+	snap snapshot
+	lsnS uint64
+	res  []resultRow
+	err  error
 }
 
 // resultRow is one query result row, already encoded.
@@ -120,7 +121,7 @@ func columnList(u *Unit, alias string) string {
 func (q *query) sql() string {
 	u := q.u
 	limit := ""
-	if q.probe {
+	if q.use == forProbe {
 		limit = " LIMIT 1"
 	}
 	if q.full {
@@ -170,27 +171,6 @@ func (q *query) run(ctx context.Context, pool *pgxpool.Pool, snapID string) {
 			}
 		}
 		args := append([]any{pgx.QueryExecModeSimpleProtocol}, paramArgs(q.u.params)...)
-		q.gateOK = true
-		for _, g := range q.u.a.Gates {
-			// Each gate binds only the parameters it reads: pgx refuses an
-			// unused argument.
-			gargs := append([]any{pgx.QueryExecModeSimpleProtocol}, paramArgs(g.GateArgs(q.u.params))...)
-			rows, err := tx.Query(ctx, g.SQL, gargs...)
-			if err != nil {
-				return err
-			}
-			has := rows.Next()
-			rows.Close()
-			if err := rows.Err(); err != nil {
-				return err
-			}
-			if !has {
-				q.gateOK = false
-			}
-		}
-		if !q.gateOK && q.full && !q.probe {
-			return nil
-		}
 		rows, err := tx.Query(ctx, q.sql(), args...)
 		if err != nil {
 			return err

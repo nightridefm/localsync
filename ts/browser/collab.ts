@@ -6,7 +6,7 @@
 // on different readers. Asserts: tabs with LocalDbConfig.alignCommits never
 // render a torn turn, and every tab converges. Reports render latency.
 //
-//   pnpm --filter @nightride/localsync-browser collab [--seconds 60] [--rate 50]
+//   pnpm browser collab [--seconds 60] [--rate 50]
 import { randomUUID } from 'node:crypto'
 import { parseArgs } from 'node:util'
 

@@ -4,7 +4,10 @@
 package rules
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"sort"
@@ -16,15 +19,15 @@ import (
 // Rule is one named rule after group expansion. SQL still uses named
 // parameters; Positional turns it into Postgres syntax.
 //
-// Every rule declares who may want it (A22), or fails to load: Public
+// Every rule declares who may want it (docs/design.md section 3.2), or
+// fails to load: Public
 // (any valid token), Claims (the token's grants must include one), a
 // $sub reference (row-scoped or gated per principal), or claims and $sub
 // together.
 type Rule struct {
-	Name     string
-	SQL      string
-	Priority int
-	Public   bool
+	Name   string
+	SQL    string
+	Public bool
 	// Claims: the token's `grants` must include at least one of these.
 	Claims []string
 	// ClientParams are the parameters the client supplies in WANT.
@@ -32,20 +35,18 @@ type Rule struct {
 }
 
 type groupFile struct {
-	Params   []string          `yaml:"params"`
-	Gate     string            `yaml:"gate"`
-	Priority int               `yaml:"priority"`
-	Public   bool              `yaml:"public"`
-	Claims   claimList         `yaml:"claims"`
-	Rules    map[string]string `yaml:"rules"`
+	Params []string          `yaml:"params"`
+	Gate   string            `yaml:"gate"`
+	Public bool              `yaml:"public"`
+	Claims claimList         `yaml:"claims"`
+	Rules  map[string]string `yaml:"rules"`
 }
 
 type ruleFile struct {
-	SQL      string    `yaml:"sql"`
-	Params   []string  `yaml:"params"`
-	Priority int       `yaml:"priority"`
-	Public   bool      `yaml:"public"`
-	Claims   claimList `yaml:"claims"`
+	SQL    string    `yaml:"sql"`
+	Params []string  `yaml:"params"`
+	Public bool      `yaml:"public"`
+	Claims claimList `yaml:"claims"`
 }
 
 // claimList is `claims: admin` or `claims: [admin, curator]`.
@@ -70,7 +71,7 @@ type file struct {
 }
 
 // Load reads a rules.yaml. Rule values are either a SQL string or a mapping
-// with sql / params / priority / public / claims.
+// with sql / params / public / claims.
 func Load(path string) ([]Rule, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -79,9 +80,14 @@ func Load(path string) ([]Rule, error) {
 	return Parse(raw)
 }
 
+// Parse reads rules.yaml strictly: an unknown key is an error, never
+// ignored, so a misspelt `claims` or `gate` fails the load instead of
+// changing what a rule shows.
 func Parse(raw []byte) ([]Rule, error) {
 	var f file
-	if err := yaml.Unmarshal(raw, &f); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	var out []Rule
@@ -89,19 +95,18 @@ func Parse(raw []byte) ([]Rule, error) {
 		var r ruleFile
 		if node.Kind == yaml.ScalarNode {
 			r.SQL = node.Value
-		} else if err := node.Decode(&r); err != nil {
+		} else if err := decodeStrict(&node, &r); err != nil {
 			return nil, fmt.Errorf("rule %s: %w", name, err)
 		}
-		out = append(out, Rule{Name: name, SQL: strings.TrimSpace(r.SQL), Priority: r.Priority, Public: r.Public, Claims: r.Claims, ClientParams: r.Params})
+		out = append(out, Rule{Name: name, SQL: strings.TrimSpace(r.SQL), Public: r.Public, Claims: r.Claims, ClientParams: r.Params})
 	}
-	for gname, g := range f.Groups {
+	for _, g := range f.Groups {
 		for name, sql := range g.Rules {
 			full := strings.TrimSpace(sql)
 			if g.Gate != "" {
 				full = andWhere(full, g.Gate)
 			}
-			out = append(out, Rule{Name: name, SQL: full, Priority: g.Priority, Public: g.Public, Claims: g.Claims, ClientParams: g.Params})
-			_ = gname
+			out = append(out, Rule{Name: name, SQL: full, Public: g.Public, Claims: g.Claims, ClientParams: g.Params})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -114,6 +119,18 @@ func Parse(raw []byte) ([]Rule, error) {
 		slices.Sort(out[i].ClientParams)
 	}
 	return out, nil
+}
+
+// decodeStrict decodes a node like the top-level decoder does: a
+// yaml.Node's own Decode ignores unknown keys.
+func decodeStrict(n *yaml.Node, v any) error {
+	raw, err := yaml.Marshal(n)
+	if err != nil {
+		return err
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	return dec.Decode(v)
 }
 
 // andWhere appends `AND (gate)` to the rule's WHERE, or adds one. The rule

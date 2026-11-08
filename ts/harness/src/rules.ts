@@ -1,10 +1,9 @@
 // Rules as the harness sees them: plain SQL over one table, with named
 // params ($sub from the principal, others supplied by the want). Bound
-// once per (rule, principal, params) into the forms each consumer needs:
-// positional SQL for the oracle, inlined literals for Electric shapes.
+// once per (rule, principal, params) into positional SQL for the oracle.
 
 /**
- * A sync rule. Access (A22): `$sub` in the SQL, `claims` (the token's
+ * A sync rule. Access (docs/design.md section 3.2): `$sub` in the SQL, `claims` (the token's
  * grants must include one), or `public`; the engine refuses anything else.
  */
 export type Rule = {
@@ -30,8 +29,6 @@ export type Bound = {
 	/** SQL with $1..$n and the values to bind (oracle). */
 	sql: string
 	values: string[]
-	/** WHERE clause with params inlined as quoted literals (Electric), or null. */
-	where: string | null
 }
 
 const SHAPE = /^\s*SELECT\s+(.+?)\s+FROM\s+("?[A-Za-z_][\w]*"?)\s*(?:WHERE\s+([\s\S]+?))?\s*$/i
@@ -64,8 +61,6 @@ function substitute(sql: string, fn: (name: string) => string): string {
 	return out
 }
 
-const literal = (v: string) => `'${v.replaceAll("'", "''")}'`
-
 export function bind(rule: Rule, principal: Principal, want: Want): Bound {
 	const m = SHAPE.exec(rule.sql)
 	if (!m) throw new Error(`rule ${rule.name}: not of the form SELECT ... FROM t [WHERE ...]`)
@@ -85,7 +80,6 @@ export function bind(rule: Rule, principal: Principal, want: Want): Bound {
 	const grants = (principal.claims?.grants as string[] | undefined) ?? []
 	const allowed = !rule.claims?.length || rule.claims.some((c) => grants.includes(c))
 	const cols = m[1]!.trim()
-	const where = m[3] ? substitute(m[3], (name) => literal(value(name))) : null
 	const params = Object.entries(want.params ?? {})
 		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
 		.map(([k, v]) => `${k}=${v}`)
@@ -98,6 +92,5 @@ export function bind(rule: Rule, principal: Principal, want: Want): Bound {
 		columns: cols === '*' ? null : cols.split(',').map((c) => c.trim().replaceAll('"', '')),
 		sql: allowed ? sql : `SELECT * FROM (${sql}) denied WHERE false`,
 		values: order.map(value),
-		where,
 	}
 }

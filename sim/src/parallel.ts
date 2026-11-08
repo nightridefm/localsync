@@ -1,7 +1,7 @@
 // Runs smash seeds in parallel, one Postgres database and one engine port
 // per worker, so a batch uses the machine instead of waiting on round trips.
 //
-//   pnpm --filter @nightride/localsync-sim parallel [--jobs 8] [--seeds 100-131] [smash flags...]
+//   pnpm sim parallel [--jobs 8] [--seeds 100-131] [smash flags...]
 import { spawn } from 'node:child_process'
 
 import { Db } from '@nightride/localsync-harness/pg.ts'

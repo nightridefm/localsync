@@ -1,8 +1,10 @@
 // One connection to the engine. The client only ever says what it wants and
 // what it has (WANT); the engine answers with the difference as atomic
-// frames (docs/design.md section 7). Reconnect, subscribe, unsubscribe and
-// resync are all the same message. The connection is a WebSocket, or HTTP
-// requests where WebSockets fail (http.ts).
+// frames (docs/design.md section 7). Reconnect, subscribe, unsubscribe,
+// token refresh and an engine restart are all the same message, each on a
+// new connection, so the haves it carries are exactly what the client has
+// applied. The connection is a WebSocket, or HTTP requests where WebSockets
+// fail (http.ts).
 import { Applier, type Db } from './apply.ts'
 import { MSG_FRAME_PART, type UnitDesc } from './codec.ts'
 import { type Conn, HttpConn, httpUrlFor, WsConn } from './http.ts'
@@ -73,8 +75,6 @@ type FailuresMsg = { type: 'failures'; failures: IdError[] }
 /** Every want is delivered (or failing): the client is caught up. */
 type SyncedMsg = { type: 'synced' }
 type ErrorMsg = { type: 'error'; message: string }
-/** The engine restarted in process (lost its replication stream): send WANT again. */
-type ResyncMsg = { type: 'resync'; epoch: string }
 /** Liveness on an idle connection (engine sends one every 15s). */
 type BeatMsg = { type: 'beat' }
 
@@ -102,18 +102,21 @@ const defKey = (w: Want, sub: string) =>
 		sub,
 	])
 
-/** The token's subject (the token is the engine's to verify; this only names state). */
-function subOf(token: string): string {
+/**
+ * The token's claims, unverified: the engine verifies tokens, the client
+ * only names its state by `sub` and schedules refreshes by `exp`.
+ */
+function claimsOf(token: string): { sub?: unknown; exp?: unknown } {
 	try {
-		const payload = JSON.parse(
-			atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/'))
-		) as {
-			sub?: unknown
-		}
-		return typeof payload.sub === 'string' ? payload.sub : ''
+		return JSON.parse(atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/')))
 	} catch {
-		return ''
+		return {}
 	}
+}
+
+function subOf(token: string): string {
+	const { sub } = claimsOf(token)
+	return typeof sub === 'string' ? sub : ''
 }
 
 export class SyncClient {
@@ -218,7 +221,7 @@ export class SyncClient {
 		this.wants = wants
 		// Not caught up on the new list until the engine says so.
 		if (this.state === 'live') this.setState('open')
-		await this.rewant()
+		this.rewant()
 	}
 
 	/** The wants the engine does not serve now (refused, then failing). */
@@ -226,15 +229,17 @@ export class SyncClient {
 		return [...this.refused, ...this.failing]
 	}
 
-	/** Send WANT again; over HTTP that is a new request. */
-	private async rewant(): Promise<void> {
+	/**
+	 * Send WANT again, on a new connection. Frames still in flight on the old
+	 * one are dropped with it, so the haves describe what is applied. With no
+	 * connection, the pending reconnect sends the current wants.
+	 */
+	private rewant(): void {
 		const conn = this.conn
 		if (!conn) return
-		if (conn.oneShot) {
-			this.conn = null
-			conn.close()
-			this.connect()
-		} else if (conn.open) await this.sendWant()
+		this.conn = null
+		conn.close()
+		this.connect()
 	}
 
 	stop(): void {
@@ -273,7 +278,7 @@ export class SyncClient {
 						params: w.params ?? {},
 					})),
 					have: db
-						.all('SELECT id, checksum FROM _lsync_unit WHERE held = 1 AND drift = 0')
+						.all('SELECT id, checksum FROM _lsync_unit WHERE checksum IS NOT NULL')
 						.map(([id, checksum]) => ({ id: Number(id), checksum: String(checksum) })),
 				}
 			})
@@ -322,19 +327,10 @@ export class SyncClient {
 	 */
 	private scheduleRefresh(token: string): void {
 		if (this.refreshTimer) clearTimeout(this.refreshTimer)
-		let exp = 0
-		try {
-			const payload = JSON.parse(
-				atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/'))
-			) as { exp?: number }
-			exp = (payload.exp ?? 0) * 1000
-		} catch {
-			return
-		}
-		const delay = Math.max(5_000, exp - Date.now() - 60_000)
-		this.refreshTimer = setTimeout(() => {
-			this.rewant().catch((err: unknown) => this.error(`token refresh: ${String(err)}`))
-		}, delay)
+		const { exp } = claimsOf(token)
+		if (typeof exp !== 'number') return
+		const delay = Math.max(5_000, exp * 1000 - Date.now() - 60_000)
+		this.refreshTimer = setTimeout(() => this.rewant(), delay)
 	}
 
 	private connect(): void {
@@ -404,7 +400,8 @@ export class SyncClient {
 				}
 			}
 			if (clean && this.heard && !this.failed) {
-				// The engine ended an HTTP response: the next one, at once.
+				// The engine ended the connection on purpose (an HTTP response
+				// that ran its course, a restart): the next one, at once.
 				this.connect()
 				return
 			}
@@ -444,13 +441,7 @@ export class SyncClient {
 	private message(data: string | ArrayBuffer, conn: Conn): void {
 		if (typeof data === 'string') {
 			this.opts.onBytes?.(data.length)
-			const m = JSON.parse(data) as
-				| UnitsMsg
-				| FailuresMsg
-				| SyncedMsg
-				| ErrorMsg
-				| ResyncMsg
-				| BeatMsg
+			const m = JSON.parse(data) as UnitsMsg | FailuresMsg | SyncedMsg | ErrorMsg | BeatMsg
 			if (m.type === 'units') {
 				this.epoch = m.epoch
 				void this.enqueue(() => this.run((db) => this.applier.setUnits(db, m.units)))
@@ -469,13 +460,6 @@ export class SyncClient {
 			} else if (m.type === 'error') {
 				this.failed = true
 				this.error(m.message)
-			} else if (m.type === 'resync') {
-				// A frame cut short by the restart never completes; its parts
-				// were never applied. Refs are per epoch, like a reconnect.
-				this.parts = []
-				void this.enqueue(async () => this.applier.resetRefs())
-				if (this.state === 'live') this.setState('open')
-				this.rewant().catch((err: unknown) => this.error(`resync: ${String(err)}`))
 			}
 			return
 		}

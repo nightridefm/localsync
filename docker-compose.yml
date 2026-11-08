@@ -1,8 +1,7 @@
-# Local Postgres + Electric baseline for the capability harness and the
-# simulation. Host ports are overridable so this can run next to an app's
-# own dev stack:
-#   LOCALSYNC_PG_PORT (default 5532), LOCALSYNC_ELECTRIC_PORT (default 3130).
-# Smoke check: scripts/check-compose.sh
+# Local Postgres for the engine's tests, the harness and the simulation:
+#   docker compose up -d --wait
+# The host port is overridable so this can run next to an app's own dev
+# stack: LOCALSYNC_PG_PORT (default 5532).
 
 name: localsync
 
@@ -17,9 +16,8 @@ services:
       - postgres
       - -c
       - wal_level=logical
-      # Bounded WAL retention for abandoned / lagging slots (the engine's
-      # slot and Electric's). A slot past this is invalidated rather than
-      # filling the disk; the engine must detect that and re-snapshot.
+      # Bounded WAL retention for an abandoned slot: past this it is
+      # invalidated rather than filling the disk.
       - -c
       - max_slot_wal_keep_size=4GB
       - -c
@@ -41,27 +39,6 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
-
-  electric:
-    # Pinned to the version the apps run in production; the baseline matrix
-    # is only meaningful against that exact version.
-    image: electricsql/electric:1.7.9
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/localsync
-      ELECTRIC_SECRET: ${ELECTRIC_SECRET:-localsync-dev-secret}
-      # Same flags as production: subquery shapes + tagged move-in/move-out.
-      ELECTRIC_FEATURE_FLAGS: allow_subqueries,tagged_subqueries
-    ports:
-      - '${LOCALSYNC_ELECTRIC_PORT:-3130}:3000'
-    healthcheck:
-      test: ['CMD-SHELL', 'curl -sf http://localhost:3000/v1/health']
-      interval: 2s
-      timeout: 3s
-      retries: 30
-      start_period: 5s
-    depends_on:
-      postgres:
-        condition: service_healthy
 
   gateway:
     # TLS gateway (nginx, like the apps') for wss:// and https:// tests;

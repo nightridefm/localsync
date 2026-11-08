@@ -1,22 +1,10 @@
 {
 	"$schema": "./node_modules/oxlint/configuration_schema.json",
-	"ignorePatterns": [
-		"**/node_modules/**",
-		"**/dist/**",
-		"corpus/**"
-	],
+	"ignorePatterns": ["**/node_modules/**", "**/dist/**", "corpus/**"],
 	"categories": {
 		"correctness": "warn"
 	},
-	"plugins": [
-		"typescript",
-		"eslint",
-		"import",
-		"promise",
-		"node",
-		"unicorn",
-		"oxc"
-	],
+	"plugins": ["typescript", "eslint", "import", "promise", "node", "unicorn", "oxc"],
 	"rules": {
 		"eslint/no-unused-vars": "error",
 		"unicorn/no-array-for-each": "error",

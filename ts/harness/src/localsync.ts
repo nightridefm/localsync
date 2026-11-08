@@ -1,6 +1,6 @@
 // localsync adapter: runs the Go engine (bin/engine) against the compose
 // Postgres with the harness rules, and the real @nightride/localsync client
-// on the same in-memory sqlite-wasm replica the Electric adapter uses.
+// on an in-memory sqlite-wasm replica.
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { createHmac, randomUUID } from 'node:crypto'
 import { mkdtempSync, writeFileSync } from 'node:fs'
@@ -387,7 +387,12 @@ export class LocalsyncAdapter implements Adapter {
 	}
 }
 
-/** Builds bin/engine (Go) so the adapter always runs the current source. */
+/**
+ * Builds bin/engine (Go) so the adapter always runs the current source.
+ * LOCALSYNC_SKIP_BUILD=1 runs whatever bin/engine holds (another version,
+ * or one build shared by parallel jobs).
+ */
 export function buildEngine(): void {
+	if (process.env.LOCALSYNC_SKIP_BUILD) return
 	execFileSync('go', ['build', '-o', 'bin/engine', './cmd/engine'], { cwd: REPO, stdio: 'inherit' })
 }

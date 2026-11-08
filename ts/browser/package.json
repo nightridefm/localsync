@@ -4,8 +4,8 @@
 	"type": "module",
 	"scripts": {
 		"check": "tsc -p tsconfig.json",
-		"smoke": "node --disable-warning=ExperimentalWarning --env-file-if-exists=../../.env run.ts",
-		"collab": "node --disable-warning=ExperimentalWarning --env-file-if-exists=../../.env collab.ts"
+		"smoke": "node --env-file-if-exists=../../.env run.ts",
+		"collab": "node --env-file-if-exists=../../.env collab.ts"
 	},
 	"dependencies": {
 		"@nightride/localsync": "workspace:*",

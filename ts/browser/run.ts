@@ -4,7 +4,7 @@
 // localdb's reactive queries (never a torn pair), and a want change sent
 // with LocalDb.syncCommand.
 //
-//   pnpm --filter @nightride/localsync-browser smoke
+//   pnpm browser smoke
 import { randomUUID } from 'node:crypto'
 
 import { ensureFixture, resetData, seedWorld } from '@nightride/localsync-harness/fixture.ts'

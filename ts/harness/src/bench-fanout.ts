@@ -1,17 +1,16 @@
 // Fan-out benchmark: many connections asking for the same, already warm
 // unit (a user's tabs and devices, a reconnect storm after a network blip).
-// localsync answers them from its snapshot cache; Electric from its shape
-// log. Reports the time until every client equals the oracle, bytes per
-// client and, for localsync, how many snapshot queries Postgres ran.
+// localsync answers them from its snapshot cache. Reports the time until
+// every client equals the oracle, bytes per client and how many snapshot
+// queries Postgres ran.
 //
-//   pnpm --filter @nightride/localsync-harness bench:fanout [--clients=20] [--rows=10000] [--write]
+//   pnpm harness bench:fanout [--clients=20] [--rows=10000] [--write]
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { parseArgs } from 'node:util'
 
 import type { Adapter } from './adapter.ts'
 import { introspect } from './catalog.ts'
-import { ElectricAdapter } from './electric.ts'
 import { ensureFixture, resetData, seedWorld } from './fixture.ts'
 import { buildEngine, LocalsyncAdapter } from './localsync.ts'
 import { Db } from './pg.ts'
@@ -19,7 +18,6 @@ import { Ctx } from './scenario.ts'
 
 const { values } = parseArgs({
 	options: {
-		adapter: { type: 'string', default: 'localsync,electric' },
 		clients: { type: 'string', default: '20' },
 		rows: { type: 'string', default: '10000' },
 		write: { type: 'boolean', default: false },
@@ -102,19 +100,13 @@ async function bench(adapter: Adapter, db: Db): Promise<Result> {
 
 const db = new Db()
 const results: Result[] = []
-for (const name of values.adapter!.split(',')) {
-	let adapter: Adapter
-	if (name === 'electric') adapter = new ElectricAdapter()
-	else {
-		buildEngine()
-		adapter = new LocalsyncAdapter()
-	}
-	if ((await ensureFixture(db)) && adapter.schemaReset) await adapter.schemaReset(db)
-	const r = await bench(adapter, db)
-	await adapter.close()
-	results.push(r)
-	console.log(JSON.stringify(r))
-}
+buildEngine()
+const adapter: Adapter = new LocalsyncAdapter()
+if (await ensureFixture(db)) await adapter.schemaReset(db)
+const r = await bench(adapter, db)
+await adapter.close()
+results.push(r)
+console.log(JSON.stringify(r))
 await db.close()
 
 if (values.write) {

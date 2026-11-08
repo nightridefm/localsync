@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -86,7 +85,7 @@ func (e *Engine) Handler() http.Handler {
 }
 
 // principal is what a verified token says: who, what it grants (rules
-// with `claims` need one of them, A22) and until when.
+// with `claims` need one of them) and until when.
 type principal struct {
 	sub    string
 	grants []string
@@ -128,12 +127,9 @@ func (e *Engine) verify(token string) (principal, error) {
 	return p, nil
 }
 
-// LOCALSYNC_WS_COMPRESSION=0 turns permessage-deflate off.
-var wsCompressionOff = os.Getenv("LOCALSYNC_WS_COMPRESSION") == "0"
-
 func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 	opts := &websocket.AcceptOptions{InsecureSkipVerify: true}
-	if !wsCompressionOff {
+	if !e.cfg.NoCompression {
 		// Per-message deflate without context takeover: initial loads and
 		// move-ins shrink ~40%, no compressor state is kept per connection,
 		// and small deltas (below the threshold, where deflate only adds
@@ -167,7 +163,12 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 			return conn.Write(wctx, typ, m.data)
 		}
 		if e.writeLoop(ctx, c, write, nil, nil) {
-			_ = conn.Close(websocket.StatusPolicyViolation, "closed by engine")
+			// c.failed is set before the loop sees c.done close.
+			if c.failed {
+				_ = conn.Close(websocket.StatusPolicyViolation, "closed by engine")
+			} else {
+				_ = conn.Close(websocket.StatusNormalClosure, "reconnect")
+			}
 		}
 	}()
 
@@ -198,7 +199,12 @@ func (e *Engine) serveSync(w http.ResponseWriter, r *http.Request) {
 		}
 		readCtx = ctx
 		e.Do(func() {
-			if !c.closed {
+			switch {
+			case c.closed:
+			case c.holds != nil:
+				// A new WANT is a new connection (docs/design.md section 7).
+				c.fail("one WANT per connection")
+			default:
 				c.exp, c.grants = p.exp, p.grants
 				e.want(c, p.sub, &m)
 			}

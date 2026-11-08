@@ -1,6 +1,6 @@
 {
 	"name": "@nightride/localsync",
-	"version": "0.1.2",
+	"version": "0.2.0",
 	"description": "localdb SyncTransport for the localsync engine",
 	"license": "MIT",
 	"repository": {

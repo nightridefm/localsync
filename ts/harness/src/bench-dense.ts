@@ -4,7 +4,7 @@
 // REPLICA IDENTITY FULL vs DEFAULT, and engine memory. Writes
 // docs/bench/dense.md with --write.
 //
-//   pnpm --filter @nightride/localsync-harness bench:dense [--docs=5000] [--wide=50000] [--write]
+//   pnpm harness bench:dense [--docs=5000] [--wide=50000] [--write]
 import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -12,7 +12,6 @@ import { parseArgs } from 'node:util'
 
 import type { Adapter } from './adapter.ts'
 import { introspect } from './catalog.ts'
-import { ElectricAdapter } from './electric.ts'
 import { ensureFixture, resetData } from './fixture.ts'
 import { buildEngine, LocalsyncAdapter } from './localsync.ts'
 import { Db } from './pg.ts'
@@ -20,7 +19,6 @@ import { Ctx } from './scenario.ts'
 
 const { values } = parseArgs({
 	options: {
-		adapter: { type: 'string', default: 'localsync,electric' },
 		docs: { type: 'string', default: '5000' },
 		wide: { type: 'string', default: '50000' },
 		write: { type: 'boolean', default: false },
@@ -180,21 +178,16 @@ const db = new Db()
 const results: Result[] = []
 let wal: { full: number; def: number } | null = null
 try {
-	for (const name of values.adapter!.split(',')) {
-		let adapter: Adapter
-		if (name === 'electric') adapter = new ElectricAdapter()
-		else {
-			buildEngine()
-			adapter = new LocalsyncAdapter()
-		}
-		if ((await ensureFixture(db)) && adapter.schemaReset) await adapter.schemaReset(db)
-		const r = await bench(adapter, db)
-		await adapter.close()
-		results.push(r)
-		console.log(JSON.stringify(r))
-		wal ??= await walPerUpdate(db)
-		await db.query(`DROP TABLE IF EXISTS ${DOC}, ${WIDE}`)
-	}
+	let adapter: Adapter
+	buildEngine()
+	adapter = new LocalsyncAdapter()
+	if (await ensureFixture(db)) await adapter.schemaReset(db)
+	const r = await bench(adapter, db)
+	await adapter.close()
+	results.push(r)
+	console.log(JSON.stringify(r))
+	wal ??= await walPerUpdate(db)
+	await db.query(`DROP TABLE IF EXISTS ${DOC}, ${WIDE}`)
 } finally {
 	await db.query(`DROP TABLE IF EXISTS ${DOC}, ${WIDE}`).catch(() => {})
 	await db.close()

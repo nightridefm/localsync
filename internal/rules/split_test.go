@@ -5,14 +5,14 @@ import (
 	"testing"
 )
 
-func TestShare(t *testing.T) {
+func TestSplit(t *testing.T) {
 	c := fixtureCatalog(t)
 	gate := `EXISTS (SELECT 1 FROM project p JOIN member m ON m.org_id = p.org_id WHERE p.id = $project AND m.user_id = $sub)`
 	simpleGate := `EXISTS (SELECT 1 FROM member m WHERE m.user_id = $sub AND m.role = 'admin')`
 	for _, tc := range []struct {
-		sql    string
-		shared bool
-		gates  int
+		sql   string
+		split bool
+		gates int
 	}{
 		// The common shape: project scope plus a permission gate.
 		{`SELECT * FROM task WHERE project_id = $project AND ` + simpleGate, true, 1},
@@ -20,10 +20,12 @@ func TestShare(t *testing.T) {
 		// A gate whose subquery joins: proposed, the engine's analysis of
 		// the derived rule then refuses it (FROM must name one table).
 		{`SELECT * FROM task WHERE project_id = $project AND ` + gate, false, 0},
-		// Rows that depend on the principal: never shared.
+		// Rows that depend on the principal split too; the body is then per
+		// principal.
+		{`SELECT * FROM kitchen_sink WHERE owner = $sub AND ` + simpleGate, true, 1},
+		// No gate: nothing to split.
 		{`SELECT * FROM task WHERE project_id IN (` + visibleProjects + `)`, false, 0},
 		{`SELECT * FROM member WHERE user_id = $sub`, false, 0},
-		// No principal at all: nothing to share across.
 		{`SELECT * FROM tag`, false, 0},
 	} {
 		var params []string
@@ -31,24 +33,21 @@ func TestShare(t *testing.T) {
 			params = []string{"project"}
 		}
 		a := analyze(t, c, tc.sql, params...)
-		if (a.Share != nil) != tc.shared {
-			t.Errorf("%s: shared=%v", tc.sql, a.Share != nil)
+		if (a.Split != nil) != tc.split {
+			t.Errorf("%s: split=%v", tc.sql, a.Split != nil)
 			continue
 		}
-		if a.Share == nil {
+		if a.Split == nil {
 			continue
 		}
-		if len(a.Share.Gates) != tc.gates {
-			t.Errorf("%s: %d gates", tc.sql, len(a.Share.Gates))
-		}
-		if strings.Contains(a.Share.Body.SQL, "$sub") {
-			t.Errorf("body uses $sub: %s", a.Share.Body.SQL)
+		if len(a.Split.Gates) != tc.gates {
+			t.Errorf("%s: %d gates", tc.sql, len(a.Split.Gates))
 		}
 		// The derived rules analyse like any rule.
-		if _, err := Analyze(a.Share.Body, c); err != nil {
-			t.Errorf("body %s: %v", a.Share.Body.SQL, err)
+		if _, err := Analyze(a.Split.Body, c); err != nil {
+			t.Errorf("body %s: %v", a.Split.Body.SQL, err)
 		}
-		for _, g := range a.Share.Gates {
+		for _, g := range a.Split.Gates {
 			if _, err := Analyze(g.Rule, c); err != nil {
 				t.Errorf("gate %s: %v", g.Rule.SQL, err)
 			}

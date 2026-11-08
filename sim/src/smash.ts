@@ -3,7 +3,7 @@
 // disconnects and engine kills, checking invariants continuously and the
 // oracle at every checkpoint. Replay a failure with the printed --seed.
 //
-//   pnpm --filter @nightride/localsync-sim smash [--seed N] [--steps N] [--clients N] [--faults]
+//   pnpm sim smash [--seed N] [--steps N] [--clients N] [--faults]
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -11,7 +11,6 @@ import { parseArgs } from 'node:util'
 
 import type { Adapter } from '@nightride/localsync-harness/adapter.ts'
 import { introspect } from '@nightride/localsync-harness/catalog.ts'
-import { ElectricAdapter } from '@nightride/localsync-harness/electric.ts'
 import { ensureFixture, resetData, seedWorld } from '@nightride/localsync-harness/fixture.ts'
 import { buildEngine, LocalsyncAdapter } from '@nightride/localsync-harness/localsync.ts'
 import { Db } from '@nightride/localsync-harness/pg.ts'
@@ -22,7 +21,6 @@ const { values } = parseArgs({
 		seed: { type: 'string' },
 		steps: { type: 'string', default: '400' },
 		clients: { type: 'string', default: '6' },
-		adapter: { type: 'string', default: 'localsync' },
 		faults: { type: 'boolean', default: false },
 		checkpoint: { type: 'string', default: '50' },
 	},
@@ -51,12 +49,9 @@ const short = (id: string) => id.slice(0, 8)
 
 const db = new Db()
 let adapter: Adapter
-if (values.adapter === 'electric') adapter = new ElectricAdapter()
-else {
-	if (!process.env.LOCALSYNC_SKIP_BUILD) buildEngine()
-	adapter = new LocalsyncAdapter()
-}
-if ((await ensureFixture(db)) && adapter.schemaReset) await adapter.schemaReset(db)
+buildEngine()
+adapter = new LocalsyncAdapter()
+if (await ensureFixture(db)) await adapter.schemaReset(db)
 await resetData(db)
 const ctx = new Ctx(db, adapter, await introspect(db))
 
@@ -265,10 +260,10 @@ const ops: Array<[number, string, () => Promise<void>]> = [
 		},
 	],
 ]
-if (values.faults && adapter.restartServer) {
-	ops.push([1, 'kill engine', async () => adapter.restartServer!()])
+if (values.faults) {
+	ops.push([1, 'kill engine', async () => adapter.restartServer()])
 }
-if (values.faults && adapter.replicationSlots) {
+if (values.faults) {
 	const slots = adapter.replicationSlots
 	ops.push([
 		1,

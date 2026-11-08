@@ -33,9 +33,20 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	if os.Getenv("LOCALSYNC_DEBUG") != "" {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	e, err := engine.New(ctx, engine.Config{PG: *pgURL, Rules: rs, JWTSecret: []byte(secret), Audience: *audience, Window: *window, Workers: *workers})
+	off := func(k string) bool { return os.Getenv(k) == "0" }
+	e, err := engine.New(ctx, engine.Config{
+		PG: *pgURL, Rules: rs, JWTSecret: []byte(secret), Audience: *audience, Window: *window, Workers: *workers,
+		NoSplit:       off("LOCALSYNC_SPLIT"),
+		NoSnapCache:   off("LOCALSYNC_SNAP_CACHE"),
+		NoEqualSkip:   off("LOCALSYNC_EQUAL_SKIP"),
+		NoCompression: off("LOCALSYNC_WS_COMPRESSION"),
+		Verify:        os.Getenv("LOCALSYNC_VERIFY") != "",
+	})
 	if err != nil {
 		return err
 	}

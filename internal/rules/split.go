@@ -1,22 +1,23 @@
 package rules
 
 import (
-	"slices"
-
 	pg "github.com/pganalyze/pg_query_go/v6"
 	"google.golang.org/protobuf/proto"
 )
 
-// Share splits a rule whose only principal-dependent parts are gates (top
-// level uncorrelated EXISTS / NOT EXISTS) into a body every principal with
-// the same other parameters shares, and one gate rule per gate. The rule's
-// rows are the body's rows while every gate holds, none otherwise, which
-// is exactly `body AND gates` because gates do not depend on the row.
+// Split splits a rule with gates (top-level uncorrelated EXISTS / NOT
+// EXISTS) into a body and one gate rule per gate. The rule's rows are the
+// body's rows while every gate holds, none otherwise, which is exactly
+// `body AND gates` because gates do not depend on the row. Each derived
+// rule binds only its own parameters, so when the principal appears only
+// in gates, every principal with the same other parameters shares one
+// body.
 //
-// Share is a proposal: the engine analyses the derived rules and checks
-// them against Postgres, and keeps the rule per principal when any step
-// fails, so a rule that does not fit simply is not shared.
-type Share struct {
+// Split is a proposal: the engine analyses the derived rules and checks
+// them against Postgres, and serves the rule unsplit when any step fails.
+// Unsplit, a gate is an ordinary subquery: correct, re-evaluated in full
+// on every change to its tables.
+type Split struct {
 	Body  Rule
 	Gates []GateRule
 }
@@ -28,8 +29,8 @@ type GateRule struct {
 	Negated bool
 }
 
-func (a *Analysis) share(sel *pg.SelectStmt, scope level) {
-	if !slices.Contains(a.Params, "sub") || sel.WhereClause == nil {
+func (a *Analysis) split(sel *pg.SelectStmt, scope level) {
+	if sel.WhereClause == nil {
 		return
 	}
 	var body []*pg.Node
@@ -72,10 +73,7 @@ func (a *Analysis) share(sel *pg.SelectStmt, scope level) {
 	if !ok {
 		return
 	}
-	if _, names := Positional(sql); slices.Contains(names, "sub") {
-		return // the rows themselves depend on the principal
-	}
-	a.Share = &Share{Body: Rule{Name: a.Rule.Name + "#body", SQL: sql, Public: true, ClientParams: a.Rule.ClientParams}, Gates: gates}
+	a.Split = &Split{Body: Rule{Name: a.Rule.Name + "#body", SQL: sql, Public: true, ClientParams: a.Rule.ClientParams}, Gates: gates}
 }
 
 // named deparses s and turns its positional parameters back into the

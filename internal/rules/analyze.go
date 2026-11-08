@@ -31,11 +31,6 @@ type Analysis struct {
 	// the WAL row itself (Pred nil means TRUE).
 	Fast bool
 	Pred Expr
-	// Gates are row-independent conjuncts (uncorrelated EXISTS / NOT
-	// EXISTS), each a standalone query `SELECT 1 WHERE <gate>`. A fast
-	// rule's unit is empty unless all gates hold; changes to a gate's
-	// tables re-evaluate the unit (Full occurrences).
-	Gates []Gate
 	// OwnNarrow are top-level AND conjuncts of the rule's own table that
 	// the engine can evaluate: a change for which one is not TRUE on either
 	// the old or the new row cannot affect the unit.
@@ -57,9 +52,9 @@ type Analysis struct {
 	// every row once it holds. Conservative for review: a condition is
 	// "rows" only when it provably reads the row (Access).
 	subRows, subGate bool
-	// Share, when set, proposes serving the rule from a body shared by
-	// every principal plus per-principal gates (share.go).
-	Share *Share
+	// Split, when set, proposes serving the rule as a body unit plus one
+	// unit per gate (split.go).
+	Split *Split
 
 	pgVersion int32
 }
@@ -117,6 +112,24 @@ func Analyze(rule Rule, cat *catalog.Catalog) (*Analysis, error) {
 	if sel == nil {
 		return nil, reject("must be a SELECT")
 	}
+	if len(sel.FromClause) == 1 {
+		if rv := sel.FromClause[0].GetRangeVar(); rv != nil {
+			if _, ok := cat.Views[rv.Relname]; ok {
+				return nil, reject("%s is a view: a rule's rows must come from a table (views are fine inside its filters)", rv.Relname)
+			}
+		}
+	}
+	expanded, err := expandViews(sel, cat)
+	if err != nil {
+		return nil, err
+	}
+	if expanded {
+		// Queries run the expanded SQL too, so they read exactly what was
+		// analysed.
+		if a.SQL, err = pg.Deparse(tree); err != nil {
+			return nil, reject("deparse: %v", err)
+		}
+	}
 	if err := checkFunctions(sel, cat); err != nil {
 		return nil, err
 	}
@@ -137,6 +150,9 @@ func Analyze(rule Rule, cat *catalog.Catalog) (*Analysis, error) {
 	if len(t.PK) == 0 {
 		return nil, reject("table %s has no primary key", t.Name)
 	}
+	if err := checkRelations(sel, cat); err != nil {
+		return nil, err
+	}
 	a.Table = t
 	if err := a.projection(sel.TargetList); err != nil {
 		return nil, err
@@ -153,8 +169,6 @@ func Analyze(rule Rule, cat *catalog.Catalog) (*Analysis, error) {
 	} else if !a.AllFull {
 		if e, ok := compile(sel.WhereClause, scope, names); ok {
 			a.Fast, a.Pred = true, e
-		} else if pred, gates, ok := a.gated(sel.WhereClause, scope, cat); ok {
-			a.Fast, a.Pred, a.Gates = true, pred, gates
 		} else {
 			for _, c := range conjuncts(sel.WhereClause) {
 				if hasSubLink(c) {
@@ -173,7 +187,7 @@ func Analyze(rule Rule, cat *catalog.Catalog) (*Analysis, error) {
 		}
 	}
 	a.tier()
-	a.share(sel, scope)
+	a.split(sel, scope)
 	// Access last, so a malformed rule reports what is wrong with it.
 	sub := slices.Contains(names, "sub")
 	a.subRows, a.subGate = subPlacement(sel.WhereClause, int32(slices.Index(names, "sub")+1))
@@ -184,7 +198,7 @@ func Analyze(rule Rule, cat *catalog.Catalog) (*Analysis, error) {
 		return nil, reject("client parameters %v are not constrained by $sub or claims (mark the rule public if intended)", rule.ClientParams)
 	}
 	if !rule.Public && len(rule.Claims) == 0 && !sub {
-		// Default deny (A22): a rule nobody declared access for would
+		// Default deny: a rule nobody declared access for would
 		// otherwise be readable by every valid token.
 		return nil, reject("no access declared: reference $sub, require claims, or mark the rule public")
 	}
@@ -215,76 +229,6 @@ func (a *Analysis) refCols(where *pg.Node, cat *catalog.Catalog) {
 	if _, ok := a.RefCols[a.Table.Name]; !ok {
 		a.RefCols[a.Table.Name] = []int{}
 	}
-}
-
-// Gate is a standalone gate query. It is numbered on its own: SQL's $i+1
-// is the rule's parameter Args[i], so it binds only the parameters it
-// reads (a gate reading $sub alone, in a rule that also has $project).
-type Gate struct {
-	SQL  string
-	Args []int
-}
-
-// GateArgs are the values of g's parameters, given the unit's values for
-// every parameter of the rule.
-func (g Gate) GateArgs(params []string) []string {
-	vals := make([]string, len(g.Args))
-	for i, j := range g.Args {
-		vals[i] = params[j]
-	}
-	return vals
-}
-
-// gated splits a WHERE into a compilable row predicate and uncorrelated
-// EXISTS gates. ok is false unless every conjunct is one or the other.
-func (a *Analysis) gated(where *pg.Node, scope level, cat *catalog.Catalog) (Expr, []Gate, bool) {
-	var local []Expr
-	var gates []*pg.Node
-	for _, c := range conjuncts(where) {
-		if isGate(c, scope) {
-			gates = append(gates, c)
-			continue
-		}
-		if hasSubLink(c) {
-			return nil, nil, false
-		}
-		e, ok := compile(c, scope, a.Params)
-		if !ok {
-			return nil, nil, false
-		}
-		local = append(local, e)
-	}
-	if len(gates) == 0 {
-		return nil, nil, false
-	}
-	var out []Gate
-	for _, g := range gates {
-		q, err := pg.Deparse(&pg.ParseResult{Version: a.pgVersion, Stmts: []*pg.RawStmt{{Stmt: &pg.Node{Node: &pg.Node_SelectStmt{SelectStmt: &pg.SelectStmt{
-			TargetList:  []*pg.Node{{Node: &pg.Node_ResTarget{ResTarget: &pg.ResTarget{Val: &pg.Node{Node: &pg.Node_AConst{AConst: &pg.A_Const{Val: &pg.A_Const_Ival{Ival: &pg.Integer{Ival: 1}}}}}}}}},
-			WhereClause: g,
-		}}}}}})
-		if err != nil {
-			return nil, nil, false
-		}
-		// Deparsed with the rule's numbering; renumber over the
-		// parameters this gate reads.
-		named, ok := Named(q, a.Params)
-		if !ok {
-			return nil, nil, false
-		}
-		sql, names := Positional(named)
-		gate := Gate{SQL: sql, Args: make([]int, len(names))}
-		for i, n := range names {
-			gate.Args[i] = slices.Index(a.Params, n)
-		}
-		out = append(out, gate)
-		a.walk(g, scope, nil, "", false, cat)
-	}
-	var pred Expr
-	if len(local) > 0 {
-		pred = andExpr(local)
-	}
-	return pred, out, true
 }
 
 // isGate: EXISTS / NOT EXISTS over a subquery that never references scope.
@@ -976,7 +920,7 @@ func operandOf(n *pg.Node, kind catalog.Kind, params []string) (operand, bool) {
 	return operand{param: -1, value: v}, true
 }
 
-// Access says who may want the rule (A22): "public", the claims a token
+// Access says who may want the rule: "public", the claims a token
 // must grant, "$sub" (row-scoped or gated per principal), or both.
 func (a *Analysis) Access() string {
 	if a.Rule.Public {

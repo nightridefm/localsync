@@ -33,12 +33,19 @@ CREATE TABLE IF NOT EXISTS _lsync_member (
 	PRIMARY KEY (unit, pk)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS _lsync_member_row ON _lsync_member (tbl, pk);
-CREATE TABLE IF NOT EXISTS _lsync_unit (
-	id INTEGER PRIMARY KEY, def TEXT NOT NULL UNIQUE, checksum TEXT NOT NULL DEFAULT '0',
-	held INTEGER NOT NULL DEFAULT 0, drift INTEGER NOT NULL DEFAULT 0,
-	tbl TEXT, pk_cols TEXT
-);
+CREATE TABLE IF NOT EXISTS _lsync_unit (id INTEGER PRIMARY KEY, def TEXT NOT NULL UNIQUE, checksum TEXT);
+CREATE TABLE IF NOT EXISTS _lsync_table (tbl TEXT PRIMARY KEY, pk_cols TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS _lsync_state (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+`
+
+// Databases synced before _lsync_table: unit rows carried held / drift flags
+// and their table's key columns. Ids are kept (WANTs already sent use them).
+const MIGRATE_UNIT_FLAGS = `
+INSERT OR IGNORE INTO _lsync_table SELECT tbl, pk_cols FROM _lsync_unit WHERE tbl IS NOT NULL AND pk_cols IS NOT NULL;
+CREATE TABLE _lsync_unit_new (id INTEGER PRIMARY KEY, def TEXT NOT NULL UNIQUE, checksum TEXT);
+INSERT INTO _lsync_unit_new SELECT id, def, CASE WHEN held = 1 AND drift = 0 THEN checksum END FROM _lsync_unit;
+DROP TABLE _lsync_unit;
+ALTER TABLE _lsync_unit_new RENAME TO _lsync_unit
 `
 
 export type ApplyResult = { tables: Set<string>; rows: number; drift: number[]; why: string[] }
@@ -50,8 +57,10 @@ export class Applier {
 	private schemaReady = false
 	/** Units by engine ref, for this connection (refs are per engine epoch). */
 	private byRef = new Map<number, UnitDesc>()
-	/** Unit ids in the latest units message: anything else is a removal. */
+	/** Unit ids in the latest units message: anything else is dropped. */
 	private current = new Set<number>()
+	/** The next frame drops units held but no longer current. */
+	private sweep = false
 	/** Why the last frame drifted, for diagnosis. */
 	private why: string[] = []
 	/** The fragment being applied, described only if it drifts. */
@@ -60,20 +69,25 @@ export class Applier {
 	ensureSchema(db: Db): void {
 		if (this.schemaReady) return
 		for (const stmt of STATE_DDL.split(';')) if (stmt.trim()) db.exec(stmt)
+		if (db.all(`SELECT 1 FROM pragma_table_info('_lsync_unit') WHERE name = 'held'`).length) {
+			db.exec('BEGIN')
+			for (const stmt of MIGRATE_UNIT_FLAGS.split(';')) if (stmt.trim()) db.exec(stmt)
+			db.exec('COMMIT')
+		}
 		this.schemaReady = true
 	}
 
 	setUnits(db: Db, units: UnitDesc[]): void {
 		this.ensureSchema(db)
 		this.current = new Set(units.map((u) => u.id))
+		this.sweep = true
 		for (const u of units) {
 			this.byRef.set(u.ref, u)
-			// Remembered so a unit can be dropped later even when no unit on
-			// its table is described in that connection.
-			db.exec('UPDATE _lsync_unit SET tbl = ?, pk_cols = ? WHERE id = ?', [
+			// How rows of the table are keyed, so they can be deleted later
+			// even when no unit on it is wanted any more.
+			db.exec('INSERT OR REPLACE INTO _lsync_table VALUES (?, ?)', [
 				u.table,
 				JSON.stringify(u.pk.map((i) => u.columns[i]!.name)),
-				u.id,
 			])
 		}
 	}
@@ -92,25 +106,19 @@ export class Applier {
 		drift: number[],
 		check = true
 	): void {
-		if (!this.current.has(u.id)) {
-			// Removal of a unit no longer wanted. The row stays (not held):
-			// it is the definition's id, and a WANT already sent may want the
-			// unit back under it; deleted, that unit's checksum would never
-			// be stored again and its next delta would read as drift.
-			db.exec(`UPDATE _lsync_unit SET held = 0, checksum = '0', drift = 0 WHERE id = ?`, [u.id])
-			return
-		}
+		// A unit no longer wanted was already dropped by the sweep.
+		if (!this.current.has(u.id)) return
 		if (!check) {
 			db.exec('UPDATE _lsync_unit SET checksum = ? WHERE id = ?', [sum.toString(), u.id])
 			return
 		}
+		// A drifted unit claims no checksum, so the next WANT gets it whole.
 		if (sum !== want) {
 			drift.push(u.id)
 			this.why.push(`unit ${u.id} (${u.rule}): checksum ${sum} != engine ${want} ${this.fragNote}`)
 		}
-		db.exec('UPDATE _lsync_unit SET checksum = ?, held = 1, drift = ? WHERE id = ?', [
-			sum.toString(),
-			sum !== want ? 1 : 0,
+		db.exec('UPDATE _lsync_unit SET checksum = ? WHERE id = ?', [
+			sum === want ? sum.toString() : null,
 			u.id,
 		])
 	}
@@ -185,30 +193,35 @@ export class Applier {
 				if (!m) orphans.set(u.table, (m = new Map()))
 				m.set(key, values)
 			}
-			// Units held locally but no longer wanted, whose removal frame was
-			// lost (the client disconnected first): drop them atomically with
-			// this frame.
-			const droppedPk = new Map<string, string[]>()
-			for (const [rawId, tbl, pkCols] of db.all(
-				'SELECT id, tbl, pk_cols FROM _lsync_unit WHERE held = 1'
-			)) {
-				const id = Number(rawId)
-				if (this.current.has(id) || tbl === null || tbl === undefined) continue
-				droppedPk.set(tbl as string, JSON.parse(String(pkCols)) as string[])
-				for (const [pk] of db.all('SELECT pk FROM _lsync_member WHERE unit = ?', [id]))
-					orphan({ table: tbl as string }, pk as string, JSON.parse(pk as string) as SqlValue[])
-				db.exec('DELETE FROM _lsync_member WHERE unit = ?', [id])
-				// Not held; the row keeps the definition's id (see finishUnit).
-				db.exec(`UPDATE _lsync_unit SET held = 0, checksum = '0', drift = 0 WHERE id = ?`, [id])
-				tables.add(tbl as string)
+			// The first frame after a units message drops every unit held but
+			// no longer wanted (or served), atomically with that frame. The
+			// unit row stays: it is the definition's id, and a later WANT may
+			// want the unit back under it.
+			if (this.sweep) {
+				const current = JSON.stringify([...this.current])
+				for (const [id, tbl] of db.all(
+					'SELECT DISTINCT unit, tbl FROM _lsync_member WHERE unit NOT IN (SELECT value FROM json_each(?))',
+					[current]
+				)) {
+					for (const [pk] of db.all('SELECT pk FROM _lsync_member WHERE unit = ?', [id!]))
+						orphan({ table: tbl as string }, pk as string, JSON.parse(pk as string) as SqlValue[])
+					db.exec('DELETE FROM _lsync_member WHERE unit = ?', [id!])
+					tables.add(tbl as string)
+				}
+				db.exec(
+					'UPDATE _lsync_unit SET checksum = NULL WHERE id NOT IN (SELECT value FROM json_each(?))',
+					[current]
+				)
 			}
 			for (const f of frame.fragments) {
 				const u = this.byRef.get(f.ref)
 				if (!u) throw new Error(`frame references unknown unit ${f.ref}`)
 				tables.add(u.table)
 				this.fragNote = `[frame lsn ${frame.lsn} reset ${f.reset} ops ${f.ops.length}]`
+				// NULL (a new or drifted unit) is followed by a RESET, or by
+				// nothing that matters: the unit is resent whole after a drift.
 				let sum = BigInt(
-					String((db.all('SELECT checksum FROM _lsync_unit WHERE id = ?', [u.id])[0] ?? ['0'])[0])
+					String(db.all('SELECT checksum FROM _lsync_unit WHERE id = ?', [u.id])[0]?.[0] ?? '0')
 				)
 				if (f.reset) {
 					for (const [pk] of db.all('SELECT pk FROM _lsync_member WHERE unit = ?', [u.id]))
@@ -295,15 +308,9 @@ export class Applier {
 				this.finishUnit(db, u, BigInt.asUintN(64, sum), f.checksum, drift, !f.continues)
 			}
 			for (const [table, keys] of orphans) {
-				const known = db.all(
-					'SELECT pk_cols FROM _lsync_unit WHERE tbl = ? AND pk_cols IS NOT NULL LIMIT 1',
-					[table]
-				)[0]
-				const local = [...this.byRef.values()].find((x) => x.table === table)
-				const pkNames = local
-					? local.pk.map((i) => local.columns[i]!.name)
-					: (droppedPk.get(table) ?? (JSON.parse(String(known?.[0] ?? 'null')) as string[] | null))
-				if (!pkNames) throw new Error(`no primary key known for table ${table}`)
+				const known = db.all('SELECT pk_cols FROM _lsync_table WHERE tbl = ?', [table])[0]
+				if (!known) throw new Error(`no primary key known for table ${table}`)
+				const pkNames = JSON.parse(String(known[0])) as string[]
 				const del = `DELETE FROM ${q(table)} WHERE ${pkNames.map((n) => `${q(n)} = ?`).join(' AND ')}`
 				for (const [key, pkv] of keys) {
 					if (
@@ -319,6 +326,7 @@ export class Applier {
 				epoch,
 			])
 			db.exec('COMMIT')
+			this.sweep = false
 		} catch (err) {
 			db.exec('ROLLBACK')
 			throw err

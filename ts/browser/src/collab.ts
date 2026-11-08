@@ -32,7 +32,6 @@ const db = new LocalDb(
 		dbName: `localsync-collab-${params.get('run')}.db`,
 		schemaSql: SCHEMA,
 		schemaVersion: 1,
-		shapes: [],
 		readers: 3,
 		alignCommits: params.get('align') === '1',
 		sync: {

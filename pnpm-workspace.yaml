@@ -7,3 +7,7 @@ engineStrict: true
 # pnpm downloads this Node and uses it for `pnpm run`, `pnpm exec` and
 # `pnpm node`. Keep in step with `engines.node` in package.json.
 useNodeVersion: 26.13.0
+
+# For every script: Node 26 warns that its experimental localStorage global
+# is unavailable whenever a dependency touches it.
+nodeOptions: --disable-warning=ExperimentalWarning

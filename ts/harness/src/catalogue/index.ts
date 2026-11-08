@@ -1,9 +1,8 @@
-// The capability catalogue (docs/design.md section 14.1), one
+// The capability catalogue (docs/design.md section 13), one
 // scenario per capability. Each returns a short note for the matrix
-// (timings, bytes) or throws Fail / Unsupported.
+// (timings, bytes) or throws Fail.
 import { randomUUID } from 'node:crypto'
 
-import { Unsupported } from '../adapter.ts'
 import { seedSink, seedWorld } from '../fixture.ts'
 import { diff, formatDiff } from '../oracle.ts'
 import { Ctx, Fail, type Scenario } from '../scenario.ts'
@@ -284,7 +283,6 @@ export const catalogue: Scenario[] = [
 		id: '8',
 		title: 'server restart: converge, no loss',
 		async run(ctx) {
-			if (!ctx.adapter.restartServer) throw new Unsupported('adapter cannot restart its server')
 			const p = ctx.principal()
 			let w!: Awaited<ReturnType<typeof seedWorld>>
 			await ctx.write(async (q) => {
@@ -314,7 +312,6 @@ export const catalogue: Scenario[] = [
 		title: 'replication connection lost: converge, no loss',
 		async run(ctx) {
 			const slots = ctx.adapter.replicationSlots
-			if (!slots) throw new Unsupported('adapter does not name its replication slots')
 			const p = ctx.principal()
 			let w!: Awaited<ReturnType<typeof seedWorld>>
 			await ctx.write(async (q) => {
@@ -351,7 +348,6 @@ export const catalogue: Scenario[] = [
 		id: '9',
 		title: 'client beyond retention still converges',
 		async run(ctx) {
-			if (!ctx.adapter.expireRetention) throw new Unsupported('adapter cannot expire retention')
 			const p = ctx.principal()
 			let w!: Awaited<ReturnType<typeof seedWorld>>
 			await ctx.write(async (q) => {
@@ -377,8 +373,6 @@ export const catalogue: Scenario[] = [
 		id: '10a',
 		title: 'authz: forged / expired token rejected',
 		async run(ctx) {
-			if (!ctx.adapter.tokenCheck)
-				throw new Unsupported('no client auth in the engine; the app proxy authorises requests')
 			return ctx.adapter.tokenCheck()
 		},
 	},
@@ -587,7 +581,7 @@ export const catalogue: Scenario[] = [
 		id: '13',
 		title: 'read-your-writes: client can tell when a write is reflected',
 		async run(ctx) {
-			// The convention from docs/design.md Q10: the write transaction
+			// The convention from docs/design.md section 12: the write transaction
 			// also records the client's last mutation id, and the client syncs
 			// its own row. The confirmation must arrive with the data it
 			// confirms, including for writes that change nothing else it syncs.
@@ -804,6 +798,40 @@ export const catalogue: Scenario[] = [
 		},
 	},
 	{
+		id: '22',
+		title: 'a rule filtering through a view: rows follow writes to its tables',
+		async run(ctx) {
+			ctx.addRule({
+				name: 'admin_projects',
+				sql: 'SELECT * FROM project WHERE org_id IN (SELECT org_id FROM admin_member WHERE user_id = $sub)',
+			})
+			const p = ctx.principal()
+			await ctx.write(async (q) => {
+				await seedWorld(q, {
+					orgs: 2,
+					projects: 3,
+					tasks: 0,
+					comments: 0,
+					memberOf: [[p.sub], [p.sub]],
+				})
+			})
+			const c = await ctx.connect(p, ['admin_projects'])
+			await ctx.converge(c)
+			// Promoted in one org, then the other, then demoted: each through
+			// the view's base table.
+			await ctx.write(
+				`UPDATE member SET role = 'admin' WHERE user_id = $1 AND org_id = (SELECT org_id FROM member WHERE user_id = $1 ORDER BY org_id LIMIT 1)`,
+				[p.sub]
+			)
+			const promote = await ctx.converge(c)
+			await ctx.write(`UPDATE member SET role = 'admin' WHERE user_id = $1`, [p.sub])
+			await ctx.converge(c)
+			await ctx.write(`UPDATE member SET role = 'member' WHERE user_id = $1`, [p.sub])
+			const demote = await ctx.converge(c)
+			return `promoted in ${promote}ms, demoted in ${demote}ms`
+		},
+	},
+	{
 		id: '18',
 		title: 'project-scoped rule with a permission gate: grant and revoke per viewer',
 		async run(ctx) {
@@ -891,7 +919,6 @@ export const catalogue: Scenario[] = [
 				await seedWorld(q, { orgs: 1, projects: 4, tasks: 500, comments: 2, memberOf: [[p.sub]] })
 			})
 			const c = await ctx.connect(p, ['projects', 'tasks', 'comments'])
-			if (!c.client.caughtUp) throw new Unsupported('the client has no caught-up signal')
 			const start = Date.now()
 			while (!c.client.caughtUp()) {
 				if (Date.now() - start > 30_000) throw new Fail('never caught up')
@@ -923,8 +950,6 @@ export const catalogue: Scenario[] = [
 			})
 			const bad = { rule: 'sink_n', params: { n: 'oops' } }
 			const c = await ctx.connect(p, ['tasks'], [bad])
-			if (!c.client.failedWants || !c.client.caughtUp)
-				throw new Unsupported('the client does not report failing wants')
 			await ctx.converge(c)
 			const start = Date.now()
 			const failing = () => c.client.failedWants!().find((f) => f.rule === 'sink_n')

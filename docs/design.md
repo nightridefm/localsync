@@ -1,19 +1,13 @@
 # localsync design
 
-Status: Phases 0 to 3 implemented (2026-10-29): harness + Electric
-baseline, corpus check, and the correct core, passing the capability
-catalogue and the smash simulation with faults. Section 17 lists what
-implementation changed. Expands the original handoff plan ("the plan",
-kept privately). Where this document amends the plan, the user agreed to it
-and it is listed under [Decisions](#decisions); everything still open is
-under [Open questions](#open-questions).
+How the engine and client work, and why. The [README](../README.md) covers
+what localsync is and how to run it. This document is for changing it.
 
-The design is built on four ideas (section 2). Most of what an engine like
-this usually needs (snapshot paths, move-in/move-out messages, holds,
-resync, priorities, disk logs, checkpoints, slot recovery) falls out of
-them as special cases instead of being built separately. The design stays
-small, and every later optimisation is a cache or a shortcut over the same
-core, never a new semantics.
+The design is four ideas (section 2). Snapshots, move-ins, revocation,
+resync, subscribe and unsubscribe all fall out of them as special cases
+instead of being built separately. Every optimisation is a cache or a
+shortcut over that core, never a new semantics, and each has a switch that
+turns it back into the slow path (section 8).
 
 ## Contents
 
@@ -29,15 +23,8 @@ core, never a new semantics.
 10. [Client](#10-client)
 11. [Auth](#11-auth)
 12. [Postgres footprint](#12-postgres-footprint)
-13. [Relays](#13-relays)
-14. [Verification: harness and simulation](#14-verification-harness-and-simulation)
-15. [Optimisation slate](#15-optimisation-slate)
-16. [Phases](#16-phases)
-17. [What implementation changed](#17-what-implementation-changed)
-18. [Decisions](#decisions)
-19. [Open questions](#open-questions)
-
----
+13. [Verification](#13-verification)
+14. [Not built yet](#14-not-built-yet)
 
 ## 1. Guarantees
 
@@ -54,19 +41,19 @@ The harness and simulation assert exactly these.
   the oracle at head, whatever restarts, disconnects or slot losses
   happened.
 - **G4 Read-your-writes.** Given a write marker, a client can wait until
-  its state reflects that write.
+  its state reflects that write (section 12).
 
-Non-goals for v1: client writes through the engine, offline mutation
-queues, multiple source databases per engine (App A runs one engine per
-tenant database).
+Out of scope: client writes through the engine, offline mutation queues,
+and more than one source database per engine (run one engine per
+database).
 
 ## 2. The four ideas
 
 ### Idea 1: everything is a unit delta
 
 A **unit** is a rule bound to parameter values: a set of rows of one table,
-defined by SQL. All units with the same normalised SQL and parameters are
-one unit, shared by every client that wants it.
+defined by SQL. All clients wanting the same rule with the same parameters
+share one unit.
 
 Everything the engine sends is a **delta** that moves units to an LSN.
 A live transaction, an initial load, a move-in, a re-run, a resync,
@@ -87,8 +74,8 @@ values". An update to the rule's own table is `pk = ANY(changed)`.
 Analysis (section 4) never decides membership. It only produces the
 restriction, and any superset of the affected rows is correct, so
 the safe fallback is always `TRUE`. Evaluating a restriction in memory
-instead of in Postgres (on the WAL row, or from maintained sets) is a
-speed-up of the same computation, verifiable against it.
+instead of in Postgres (on the WAL row) is a speed-up of the same
+computation, verifiable against it.
 
 ### Idea 3: atomicity is a frontier
 
@@ -96,9 +83,9 @@ Each unit is **known through** some LSN. A client's cursor is the
 **minimum** over the units it holds, and the engine only sends a client
 frames up to that minimum. A unit waiting on a query just lags; its
 clients wait, nobody else does. This single rule gives atomic transactions
-across units, atomic subscribe and unsubscribe, atomic move-ins, safe
+across units, atomic subscribe and unsubscribe, atomic move-ins, and safe
 coalescing (a frontier that jumps skips intermediate states, never mixes
-them) and priorities (one frontier per priority class).
+them).
 
 ### Idea 4: one connection message, reconcile
 
@@ -111,13 +98,12 @@ between what the client has and what it should have.
 
 ### Consequence: the engine holds only caches
 
-Postgres is the only truth. Everything in the engine (maintained sets, the
-recent-transaction window, unit results, snapshots) is a cache. Losing any
-of it (crash, deploy, network drop of the replication connection) costs
-Postgres reads, never correctness: the engine rebuilds lazily and clients
-reconcile by checksum. That is why the replication slot can be temporary
-(section 12) and why v1 has no disk log, no checkpoints and no retention
-policy.
+Postgres is the only truth. Everything in the engine (unit state, the
+recent-transaction window, snapshots) is a cache. Losing any of it (crash,
+deploy, a dropped replication connection) costs Postgres reads, never
+correctness: the engine rebuilds lazily and clients reconcile by checksum.
+That is why the replication slot can be temporary (section 12) and why
+there is no disk log, no checkpoint and no retention policy.
 
 ## 3. Rules
 
@@ -144,7 +130,6 @@ groups:
     gate: >
       EXISTS (SELECT 1 FROM project_grant WHERE user_id = $sub
               AND project_id = $project AND role IN ('owner','editor','viewer'))
-    priority: 0
     rules:
       project/tasks: SELECT * FROM task WHERE project_id = $project
       project/comments: >
@@ -152,115 +137,118 @@ groups:
           (SELECT id FROM task WHERE project_id = $project)
 ```
 
-A group's gate is ANDed into each rule before analysis, so every rule is
-still one plain SQL query: the same text is the config, the spec, the
-oracle and (via a converter in the harness) the Electric shape. Corpus
-shapes convert mechanically: `SELECT <columns or *> FROM <table> [WHERE
-<where>]`.
+A group's gate is ANDed into each of its rules before analysis, so every
+rule is still one plain SQL query: the same text is the config, the spec
+and the oracle.
 
-### 3.2 Parameters and gates
+### 3.2 Access and parameters
 
-- **Every rule declares who may want it** (A22), or fails to load:
+- **Every rule declares who may want it**, or fails to load. With no
+  routes in front of the engine, any valid token can want any rule, so an
+  undeclared rule would be readable by everyone:
   - `$sub` in its SQL: rows or a gate scoped to the principal.
   - `claims: [a, b]`: the token's `grants` must include one of them.
   - Both: `claims` and `$sub`.
   - `public: true`: any valid token.
-  `engine plan` prints this as the Access column.
+
+  `engine plan` prints this as the Access column, which is the review
+  surface. It calls a condition "rows" only when the condition provably
+  reads the row's own columns.
 - `$sub` and `grants` come from the token. The app's token endpoint mints
-  it, running the same checks its routes run today, so coarse rights
-  (admin, curator, tenant member) stay in the app's code.
+  it with the same checks its own routes run, so coarse rights (admin,
+  curator, tenant member) stay in the app's code.
 - **Claims are checked at every `WANT`**, all wants in one pass, in
   memory. A refused want gets an error (`not allowed`), so apps can tell
-  "not allowed" from "empty". A token refresh is a `WANT`, so a grant
+  "not allowed" from "empty". A token refresh is a new `WANT`, so a grant
   missing from the new token drops its units in the next frame. Claims
   are therefore as fresh as the token: keep it short-lived (minutes), and
-  gate on tables for anything that must revoke at once (A11).
+  gate on tables for anything that must be revoked at once.
 - **Client parameters** (`$project`) come from `WANT`. A rule that uses
   one must be constrained by `$sub` or claims, or be marked `public:
-  true`. Gates are ordinary SQL, maintained like any other part of the
-  rule, so revoking a `project_grant` row revokes the units in the same
-  frame.
-- Named parameters are rewritten to `$1..$n` with a lexer-aware pass
-  (skipping literals, quoted identifiers, dollar-quoting, comments) before
-  parsing with `pg_query_go`; types are inferred from use sites.
+  true`.
+- Named parameters are rewritten to `$1..$n` by a lexer-aware pass
+  (skipping literals, quoted identifiers, dollar quoting and comments)
+  before parsing with `pg_query_go`; types are inferred from use sites.
 
-### 3.2a Unit gates
+### 3.3 Gates
 
 A top-level `EXISTS` / `NOT EXISTS` conjunct that never references the
-rule's table (a per-project permission gate) is a **unit gate**: membership
-is `row predicate AND gate`, the gate is a per-unit boolean computed with
-every full evaluation of the unit, and a change to a gate's tables
-re-evaluates the unit. The row predicate stays on the fast path, which is
-why 134 of App A's 140 tenant rules are tier 1 (measured on the private
-corpus). Each gate is numbered on its own and binds only the parameters it
-reads: a gate reading `$sub` alone, in a rule that also has `$project`,
-gets `$sub`. (v0.1.0 bound every parameter of the rule, and pgx refuses an
-unused argument; that only showed in rules that cannot be shared, `$sub`
-in the rows plus a client parameter, which App A has one of. Catalogue 19.)
+rule's table (a per-project permission check) is a **gate**: membership is
+`body AND gate`, where the body is the rule without its gates. Gates do
+not read the row, so the engine serves a gated rule as separate units:
 
-**Shared bodies.** When `$sub` appears only in gates, the rows do not
-depend on the principal, only whether they are visible at all. Such a
-rule is served from one **body** unit per non-principal parameters (the
-rule without its gates: one unit per project, shared by every viewer)
-and one small **gate unit** per gate and principal: the gate's subquery
-as a rule of its own (`EXISTS (SELECT 1 FROM t WHERE ...)` becomes `SELECT
-* FROM t WHERE ...`), which holds when it is non-empty (`NOT EXISTS`: when
-empty). This is exactly `body AND gates`, because gates do not read the
-row. Gate units are ordinary units, so routing, restrictions, gaps,
+- one **body** unit, keyed by the parameters the body reads. When `$sub`
+  appears only in gates, that is one unit per project, shared by every
+  viewer.
+- one small **gate unit** per gate, keyed by the parameters the gate
+  reads: the gate's subquery as a rule of its own (`EXISTS (SELECT 1 FROM
+  t WHERE ...)` becomes `SELECT * FROM t WHERE ...`), which holds when it
+  is non-empty (`NOT EXISTS`: when empty).
+
+Body and gate units are ordinary units, so routing, restrictions, gaps,
 rounds and frontiers need nothing new; history entries record the member
 count, so a gate's value at any frame LSN is a lookup. Per viewer, a
 frame sends the body's ops while its gates hold, an empty `RESET` when one
-closes, and when they open again the body as a snapshot (usually from the
-snapshot cache), with the frontier held at the client's cursor until it
-can be delivered. Permission changes no longer re-evaluate the body at
-all; each viewer costs one tiny unit instead of a copy of the project.
+closes, and the body as a snapshot (usually from the snapshot cache) when
+they open again, with the frontier held at the client's cursor until it
+can be delivered. A permission change re-evaluates only a tiny gate unit,
+never the body, and the body keeps its own strategy: on both apps' real
+rules, every gated rule's body is evaluated on the row or by the same
+restricted queries as before the split.
 
-Sharing is decided at rule load and is fail-safe: the split is purely
-syntactic (top-level conjuncts), and the rule stays per principal if the
-body still uses `$sub`, a gate's subquery is not one table, or a derived
-rule fails analysis or Postgres' `PREPARE` (an unqualified name in a gate
-that resolved to the outer table would change meaning once the gate
-stands alone). Derived rules are never wantable. `LOCALSYNC_SHARE=0`
-turns sharing off. Catalogue 18 and the simulation (sims wanting
-`shared_tasks` / `shared_comments` while memberships are granted and
-revoked) cover it.
+Gates are ordinary SQL, maintained like any other unit, so deleting a
+`project_grant` row revokes the units in the same frame as the deleting
+transaction.
 
-### 3.3 Accepted rules
+The split is decided at rule load and is fail-safe: it is purely
+syntactic (top-level conjuncts), and the rule is served unsplit if a
+gate's subquery is not one table, or a derived rule fails analysis or
+Postgres' `PREPARE` (an unqualified name in a gate that resolved to the
+outer table would change meaning once the gate stands alone). Unsplit,
+a gate is just a subquery: correct, re-evaluated in full on every change
+to its tables. Derived rules are never wantable.
 
-Any filter; the output must be rows of one table, including its PK, with
-plain (not computed) columns, so the client can store them by PK.
-Top-level semijoins are normalised to `EXISTS`; top-level aggregates,
-window functions, set operations and computed columns are rejected.
-`ORDER BY ... LIMIT` is accepted (always re-evaluated with restriction
-`TRUE`). Views are expanded. Volatile functions (`now()`, `random()`,
-`current_setting()`, sequences) are rejected: visibility would change
-without WAL. `LANGUAGE sql` functions are inlined; other user functions are
-rejected unless `IMMUTABLE` with declared table deps, because a table
-outside the publication is never decoded, so "re-run on any commit"
-cannot be a fallback the way it is in localdb. Virtual generated columns
-(PG 18's default kind) are never replicated, so rules must not filter on
+### 3.4 Accepted rules
+
+Any filter over tables in `public`; the output must be rows of one table,
+including its PK, with plain (not computed) columns, so the client can
+store them by PK. Joins live in subqueries and gates. Top-level semijoins
+are normalised to `EXISTS`; top-level aggregates, window functions, set
+operations and computed columns are rejected. `ORDER BY ... LIMIT` is
+accepted and always re-evaluated with restriction `TRUE`.
+
+**Views** are expanded: before analysis, every view a rule reads is
+replaced by its definition as a subquery, recursively, so analysis, the
+publication and the queries only ever see tables (the engine must decode
+every table a rule reads). A view is a named subquery, so this changes no
+result. A rule's own `FROM` must still be a table, and a
+`security_barrier` view is refused, since inlining it would drop its
+protection. Any other relation (another schema, an unknown name, a CTE
+inside a subquery) is refused at load, so `engine plan` catches what
+`engine serve` could not publish.
+
+Every function must be `IMMUTABLE`, and SQL value functions
+(`CURRENT_TIMESTAMP`) are rejected: anything else (`now()`, `random()`,
+`current_setting()`, sequences, a user function reading another table)
+can change visibility without WAL. Virtual generated columns (Postgres
+18's default kind) are never replicated, so rules must not filter on
 them.
 
-One client may not hold two units on the same table with different column
-lists (rejected at `WANT`); this avoids per-row column masks entirely.
+### 3.5 `engine plan`
 
-### 3.4 Plan output
+`engine plan --rules rules.yaml` prints, per rule, its access (section
+3.2), tier and evaluation strategy (section 4.2), and dependency tables.
+`--max-tier` makes it exit non-zero when a rule needs Postgres re-queries
+for its common changes, for CI.
 
-Startup prints, per rule, who may want it (Access, section 3.2), the
-evaluation strategy of each part (section 4.2), its dependency tables,
-and which maintained sets it shares. Reviewing access means reading the
-Access column of `engine plan`.
-`engine plan rules.yaml --max-strategy=memory` lets CI fail when a rule
-needs Postgres re-queries for its common changes.
-
-`engine plan` also runs every rule the way the engine will (the Run
-column): its gates, then the body as a whole-unit query and as a
-restricted one, through the engine's own query code, read only and at
-most one row, with a sample value of each parameter's inferred type; for
-a shared rule, its body and gate rules as well. Analysis accepts SQL that
-fails only when run (a cast of a parameter, a gate bound wrongly), and
-those failures belong at deploy, not in a user's browser. Any failure
-exits non-zero; `--run=false` skips it.
+It also runs every rule the way the engine will serve it (the Run
+column): a split rule as its body and each gate, any other as itself,
+each as a whole-unit query and as a restricted one, through the engine's
+own query code, read only and at most one row, with a sample value of
+each parameter's inferred type. A split rule's tier is its body's.
+Analysis accepts SQL that fails only when run (a cast of a parameter),
+and those failures belong at deploy, not in a user's browser.
+`--run=false` skips it.
 
 ## 4. Computing deltas
 
@@ -271,91 +259,43 @@ changed row to the units it can affect and a restriction per unit:
 
 | Change | Restriction (rows of the rule's table to re-check) |
 | --- | --- |
-| row of the rule's own table T | `pk = ANY(changed pks)` |
+| row of the rule's own table | `pk = ANY(changed pks)` |
 | row of a table inside a monotone chain (`IN`, `EXISTS`, equi-join) | the **delta query**: the chain with the changed row's values substituted, e.g. `id IN (SELECT document_id FROM document_team WHERE team_id = $changed)` |
 | row of a table under a non-monotone node (`NOT IN`, `NOT EXISTS`, aggregates, `LIMIT`) | `TRUE` (re-evaluate the unit) |
 | anything analysis does not understand | `TRUE` |
 
 Which units are affected comes from the same substitution: a change to
 `team_member(user_id = U)` affects only units of rules over `team_member`
-bound to `$sub = U`. When analysis cannot narrow the units, all units of
-the rule are affected; their restricted queries run as one batched query
-over the parameter list (`LATERAL` over `VALUES`), not one per unit.
+bound to `$sub = U`. When analysis cannot narrow the units, every unit of
+the rule is affected.
 
 ### 4.2 Evaluation strategies
 
-The restriction can be evaluated three ways, chosen per rule part by
-analysis. They are the plan's tiers, now defined as speed-ups of one
-computation:
+A restriction is evaluated one of two ways, chosen per rule by analysis.
+They are speed-ups of one computation, not separate mechanisms:
 
-1. **On the row** (tier 1). Restriction is the changed rows themselves and
-   the predicate is row-local over a whitelist of operators whose
-   Postgres semantics the engine reproduces exactly (ints, numerics,
-   uuids, bools, timestamps, `C`-collated text, `IS [NOT] NULL`,
+1. **On the row** (tier 1). The predicate is row-local over a whitelist of
+   operators whose Postgres semantics the engine reproduces exactly (ints,
+   numerics, uuids, bools, timestamps, `C`-collated text, `IS [NOT] NULL`,
    `IS DISTINCT FROM`, `IN (list)`, `= ANY`, three-valued `AND/OR/NOT`).
-   Old and new row (FULL replica identity) give `was_in` / `is_in`
-   directly. Anything outside the whitelist (other collations, `citext`,
-   `LIKE`, jsonb operators) is evaluated by Postgres as a restricted
-   query, `pk = ANY(changed)`, not by a separate mechanism.
-2. **From maintained sets** (tier 2, Phase 4). The inner parts of chains
-   (`S = {team_id | team_member.user_id = $sub}`) are maintained in
-   memory as counted multisets over small projection indexes. Identical
-   normalised subtrees are **one** set shared by every rule using them
-   (all ten of App B's per-team rules share one `team_member` set per user):
-   this common-subexpression sharing replaces the plan's separate key
-   decomposition. A set delta gives the delta query's keys without asking
-   Postgres; only rows whose content the engine does not hold (move-ins)
-   still need a query, restricted to those keys.
-3. **In Postgres** (tier 3). The restricted query at a spliced snapshot,
-   diffed against the unit's stored `pk -> row hash` for the restricted
-   rows.
+   Old and new row give "was in" and "is in" directly.
+2. **In Postgres** (tiers 2 and 3). The restricted query at a spliced
+   snapshot, diffed against the unit's stored per-column hashes for the
+   restricted rows. Tier 2 rules are monotone chains that maintained sets
+   could serve from memory (section 14); tier 3 needs Postgres for good.
+   Anything outside the tier 1 whitelist (other collations, `citext`,
+   `LIKE`, jsonb operators) is a restricted query too, `pk = ANY(changed)`.
 
-**Column pruning** (built in Phase 4, before any maintained set):
-membership is a function of the columns a rule reads, so an update that
-changes none of them (on the rule's table: a content update; on a table
-inside its subqueries: an irrelevant one) cannot change any unit's
-membership. The former becomes a direct `PUT` for members, the latter is
-skipped. The analysis records these columns per table (`RefCols`, an
-over-approximation by name, which is always safe). This took tier-2 update
-latency from 5.1 to 1.5 ms p50 in `docs/bench/`.
+**Column pruning.** Membership is a function of the columns a rule reads,
+so an update that changes none of them cannot change any unit's
+membership: on the rule's table it becomes a direct `PUT` for members, on
+a table inside its subqueries it is skipped. Analysis records these
+columns per table (`RefCols`, an over-approximation by name, which is
+always safe).
 
-Every transaction is processed in two phases (apply all its changes to
-sets, then compute memberships before vs after the whole transaction),
-so the order of rows inside a transaction, including rules that filter a
-table by a subquery on the same table (three in App B), never matters.
-
-### 4.3 Corpus expectations
-
-Phase 2 checks these mechanically. Both apps should need only strategies
-1 and 2 for common changes.
-
-**App B** (86 shapes, 39 tables, PG 18, Electric 1.7.9):
-
-| Pattern | Count | Strategy | Sharing |
-| --- | --- | --- | --- |
-| no `WHERE` | 52 | 1 | one unit per table and column list, all roles |
-| row-local `user_id = $sub` | 1 | 1 | per user |
-| `IN` chains, 1 to 4 levels deep | 31 | 2 | per user, shared sets |
-| `OR` of two chains | 1 | 2 | per user |
-| `NOT IN` without `$sub` | 1 | 2; the inner column is a PK, so no NULL tracking | one unit for the role |
-| filtered by a subquery on the same table | 3 of the above | 2, two-phase | per user |
-| column projection (a `user` directory, within the 52) | 1 | 1 | shared |
-
-**App A** (153 shapes, a control-plane database and per-tenant databases):
-
-| Pattern | Count | Strategy | Sharing |
-| --- | --- | --- | --- |
-| no `WHERE` (admin tables, shared libraries) | 29 | 1 | per database |
-| `project_id = $project` (+ gate) | 111 | 1, gate 2 | one unit per project, shared by its members |
-| `$project` with an extra row-local conjunct | 2 | 1, gate 2 | per project (one also per user) |
-| one hop via a project-owned parent | 5 | 2, gate 2 | per project |
-| `$sub` row-local (incl. `user_id IS NULL OR user_id = $sub`) | 3 | 1 | per user |
-| global rows (`project_id IS NULL`, one hop via it) | 2 | 1 / 2 | shared |
-| `project` by id (+ gate) | 1 | 1, gate 2 | per project |
-
-App A's `project` shape is unscoped today only because of Electric
-subquery bugs; the rule it wants, `project WHERE id IN (SELECT project_id
-FROM project_grant WHERE user_id = $sub)`, is strategy 2.
+The order of rows inside a transaction never matters: restricted queries
+run after the whole transaction has been routed, at a snapshot that
+contains all of it.
 
 ## 5. Snapshots and the splice
 
@@ -378,7 +318,7 @@ streamed transaction `X` with commit LSN `c(X)`:
 
 Filtering is per xid, not by an LSN cut, because a commit record can be
 written before the transaction leaves the ProcArray. Stream xids (32-bit)
-are widened to `xid8` with the epoch of the snapshot's `xmin`.
+are widened to `xid8` with the epoch of the snapshot's `xmax`.
 
 **Regular snapshots.** Let `B` be the largest commit LSN among visible
 transactions (known once the stream passes `L_S`). The snapshot is
@@ -387,47 +327,54 @@ result is exactly "the database at `B`" and the unit can be declared known
 through `B`. Irregular snapshots (a tiny race window) are retried. This is
 what lets query results join the frontier (section 6) without tearing.
 
+**Fences.** A result must wait until the stream has passed `L_S`. If the
+last routed commit record ends at or after `L_S`, every earlier commit has
+been streamed and nothing waits. Otherwise, when nothing else is
+committing, the engine updates `sync.fence` and waits to see it in the
+stream. Fences are written only on demand.
+
 The splice is used for everything slow: unit creation (restriction
-`TRUE`), move-ins, strategy-3 deltas, building maintained sets, adding a
-table to the publication (wait for the `ALTER PUBLICATION` commit to pass
-in the stream, then splice), and reconcile. Results for the same
-`(query, params, B)` are shared between units and clients; a bounded pool
-of query workers caps load on Postgres.
+`TRUE`), move-ins, restricted queries and reconcile. Clients waiting on
+the same unit share one query, and a bounded pool of query workers caps
+the load on Postgres.
 
 ## 6. Frontiers
 
 - Each unit has `known(u)`, an LSN. A unit whose deltas are computed on
-  the pipeline (strategies 1 and 2 without move-ins) is known through
-  every transaction as soon as it is routed.
+  the row is known through every transaction as soon as it is routed.
+- **Pending units.** A transaction `T` that gives `u` a query-dependent
+  delta makes `u` **pending**: `known(u)` stays below `c(T)`. The pipeline
+  keeps going, and later changes to `u` are buffered. When the restricted
+  query returns at a regular boundary `B`, `u` becomes known through `B`:
+  rows inside the restriction come from the query result, rows outside it
+  from the buffered changes up to `B`.
+- **Full re-evaluation is the universal fallback.** A restriction that
+  committed before `B` but was routed after the query was issued is not
+  covered by its result, so the unit is re-evaluated whole. A whole-unit
+  evaluation covers everything up to its own boundary, so it always
+  resolves.
 - **Resolution gaps.** A query resolution is a *jump*: the unit's state is
   known at `p` (just before its first pending transaction) and at `B`, but
   undefined strictly between them. History entries record that gap, and a
-  frame may only land on an LSN that is inside no held unit's gap, so the
-  frontier is "the largest LSN `<= min(known)` valid for every unit", not
-  just the minimum. (Found by the harness: with plain `min(known)`, a frame
-  at 104 showed one unit resolved at 100 and another still at its
-  pre-100 state, a torn transaction.)
+  frame may only land on an LSN inside no held unit's gap, so the frontier
+  is "the largest LSN `<= min(known)` valid for every unit", not just the
+  minimum. With plain `min(known)`, one unit resolved at 100 and another
+  still at its state before 100 could share a frame at 104: a torn
+  transaction.
 - **Snapshot rounds.** Gaps alone are correct but could stall a client
   whose units keep resolving at different `B`s. All queries scheduled
   together run in one round: a leader transaction exports its snapshot
   (`pg_export_snapshot()`) and workers import it, so units resolved in the
   same round share `B` and their gaps end together.
-- A transaction `T` that gives `u` a query-dependent delta makes `u`
-  **pending**: `known(u)` stays below `c(T)`. The pipeline keeps going;
-  later fast deltas for `u` are kept (by reference into the
-  recent-transaction window). When the restricted query returns at a
-  regular boundary `B`, `u` becomes known through `B`: rows inside the
-  restriction come from the query result, rows outside it from the kept
-  deltas up to `B`. Restrictions that arrived for transactions up to `B`
-  after the query was issued go into the next round; each round covers
-  through its own `B`, so it converges.
-- A client's frontier is `min(known(u))` over its units, per priority
-  class. The engine sends a frame when the frontier advances, covering
-  everything up to it in one frame. Fragments for transactions the client
-  skips over are merged (net op per row), which is the coalescing.
-- Head-of-line blocking is per client and only behind its own pending
-  units; the global pipeline never waits. Priority classes are separate
-  frontiers, so core data is never stuck behind a heavy table.
+- **Frames.** A client's frontier is the valid `min(known(u))` over its
+  units. The engine sends a frame when the frontier advances, covering
+  everything up to it. Ops for transactions the client skips over are
+  merged (one net op per row), which is the coalescing.
+- **Head-of-line blocking** is per client and only behind its own pending
+  units; the global pipeline never waits. Per-unit frontiers would remove
+  it but cost cross-unit atomicity. Measured, the engine sent a 20,000-row
+  move-in 36 ms after the grant; the rest was the client applying it,
+  which the bulk apply path (section 10.2) brought down to 215 ms.
 - **Failing units hold no one back.** A query that fails (a rule that
   errors for some parameters, a gate Postgres refuses) is retried as a
   whole-unit evaluation with backoff (250 ms doubling to 30 s), the unit
@@ -436,33 +383,34 @@ of query workers caps load on Postgres.
   (or on one of its gate units) is **broken**: left out of its client's
   frontier, held empty on the client (a `RESET` in the next frame) and
   reported (section 7). The client's other units carry on. When a query
-  for the unit succeeds again its holds are mended: each gets a fresh
-  snapshot and rejoins the frontier like a new want. (v0.1.0 left a unit
-  whose creating query failed in `creating` for good, with nothing to
-  re-run it; its `known` of 0 held every client wanting it at its cursor,
-  so one bad rule emptied App A's whole project database. Catalogue 21.)
+  for the unit succeeds again, its holds get a fresh snapshot and rejoin
+  the frontier like a new want.
 
-Transactional subscription changes fall out: a new unit starts pending;
-the client's frontier (for that class) waits for it, then one frame
-carries the new unit's `RESET` + rows, the removal of dropped units, and
-any live changes, all at one LSN. A project switch in App A (about 118
-units out, 118 in) is one `WANT` and one frame.
+Transactional subscription changes fall out: a new unit starts pending,
+the client's frontier waits for it, then one frame carries the new unit's
+`RESET` and rows, the removal of dropped units, and any live changes, all
+at one LSN. A project switch of about 118 units out and 118 in is one
+`WANT` and one frame.
 
 ## 7. Reconcile
 
-`WANT` carries: token, wants `[(rule, params)]`, and haves: the engine
-epoch and cursor the client last saw, and a checksum per held unit.
+`WANT` carries the token, the wants `[(id, rule, params)]`, and the haves:
+the engine epoch and cursor the client last saw, and a checksum per held
+unit.
 
 The engine resolves wants to units (refusing unauthorised ones) and
 answers per unit:
 
 | Client has | Engine sends |
 | --- | --- |
-| unit not wanted any more, or not authorised | `RESET` with no rows (removal) |
-| same epoch, cursor inside the recent window | the kept deltas from the cursor |
-| anything else (older cursor, new epoch, after an engine restart) | evaluate the unit at a regular snapshot; equal checksum: nothing, just known through `B`; different: `RESET` + rows |
+| same epoch, cursor inside the unit's history | the unit's history from the cursor |
+| anything else (older cursor, new epoch, after an engine restart) | a snapshot at a regular boundary; equal checksum: nothing, just known through `B`; different: `RESET` + rows |
 | unit not held | `RESET` + rows |
-| unit held but not in the wants | nothing from the engine; the client drops it inside the next frame's transaction (the engine forces one) |
+| unit held but not wanted, or no longer authorised | the client drops it inside the next frame's transaction (the engine forces one) |
+
+The client owns dropping units it no longer wants. A client that swapped
+projects and disconnected before the removal frame arrived would
+otherwise keep the old unit's rows forever.
 
 **Refused and failing wants.** The `UNITS` answer lists refused wants
 (`errors`: unknown rule, not allowed, a missing or unknown parameter),
@@ -473,86 +421,80 @@ both to the app (section 10.1).
 
 **Caught up.** After the frame in which every hold of the latest `WANT`
 is delivered (or broken), the engine sends `SYNCED`, once per `WANT`. The
-client reports `live` only then, after that frame is applied: `live`
-means the local database holds every unit it can have, at one LSN.
-(v0.1.0's client said `live` when the socket opened, before any data;
-App A showed "No modules yet" on a page that had modules. Catalogue 20
-and the browser smoke check that the first `live` comes with the whole
-load.)
+client reports `live` only after that frame is applied: `live` means the
+local database holds every unit it can have, at one LSN.
 
-Haves describe the principal they were synced for: the client names each
-unit by (rule, params, the token's `sub`), so when another user signs in
-on the same local database (sign out and in, an admin's masquerade) none
-of the first user's units match. They are held but not wanted, so the
-first frame drops them, and the new user's units arrive whole (catalogue
-7b). Naming units by rule and params alone resumed the first user's
-state as the second's: a leak, found by App B's shadow comparison.
+**Haves belong to a principal.** The client names each unit by (rule,
+params, the token's `sub`), so when another user signs in on the same
+local database none of the first user's units match. They are held but
+not wanted, so the first frame drops them, and the new user's units
+arrive whole. Naming units by rule and params alone would resume the first
+user's state as the second's.
 
-Haves count only on a connection's first `WANT`. Later `WANT`s on the
-same connection (a project switch, a token refresh) keep the holds they
-share with the last one untouched, and a hold that is new gets `RESET` +
-rows whatever the client says it has. The client writes its haves from
-what it has applied, and the engine may already have sent frames it has
-not: switching away from a project and straight back sends a removal of
-the project's units and then a `WANT` that still lists them as held
-(catalogue 15b). Over
-HTTP every `WANT` is a new connection (section 9.1), so haves always
-count there.
+**Every `WANT` is a new connection.** A project switch, a token refresh
+or an engine restart closes the connection and opens another with the new
+`WANT`; the engine refuses a second `WANT` on one connection. The client
+writes its haves from what it has applied, and frames still in flight on
+the old connection are dropped with it, so the haves are exactly the
+client's state and the engine can trust them. The price is one handshake
+per want change; locally it does not show in a project swap.
+
+Anything the client has that the engine does not hold after a `WANT`
+(no longer wanted, refused, or wanted under a token that lost a grant)
+makes the engine force the next frame, inside which the client drops it.
 
 **Checksums.** A column hash is a 64-bit FNV pair over (column index,
 canonical wire bytes of the value), so client and engine hash identical
 bytes; a row hash is the sum of its column hashes (so `PATCH` can carry
 the new row hash after changing a few columns). A unit's checksum is
 `sum(mix(row hash)) mod 2^64` over its members, `mix` being the
-splitmix64 finalizer. The mix is essential: without it the checksum is a
-sum over (column, value) pairs and cannot see values moving between rows
-(two projects swapping orgs), which is what made the reconnect skip unsafe
-(A16). Still additive per row, so PUT adds the new row's term and
-subtracts the old (the engine keeps per-column hashes per member) and
-REMOVE subtracts. Checksums ride along in
-frames periodically, so they are also an always-on production verifier.
+splitmix64 finalizer. The mix matters: without it the checksum is a sum
+over (column, value) pairs and cannot see values moving between rows (two
+projects swapping orgs), and an equal-checksum reconnect would keep stale
+rows. The checksum stays additive per row: `PUT` adds the new row's term
+and subtracts the old (the engine keeps per-column hashes per member),
+`REMOVE` subtracts. Every fragment carries its unit's checksum, so
+checksums are also an always-on production verifier.
 
-The recent-transaction window is in memory (default 5 minutes or 256 MiB),
-serving brief disconnects only. Everything older reconciles by checksum,
-which after an unchanged deploy sends nothing but frontier updates.
-Bucketed checksums (send only differing PK-hash buckets) are the first
-optimisation if whole-unit `RESET`s turn out to be common (section 15).
+The recent history is in memory (default 5 minutes, at most 32 MiB per
+unit) and serves brief disconnects only. Everything older reconciles by
+checksum, which after an unchanged deploy sends nothing but frontier
+updates.
 
 ## 8. Engine
 
 ```
- Postgres 18 ── temporary slot, pgoutput ──> [decode] -> [route: sets, row eval, restrictions]
-      ^                                                      |
-      |  spliced restricted queries (RR, bounded pool)       v
-      +─────────────────────────────── [query workers] <- [units + frontiers]
-                                                             |
-                                    [encode fragment once per unit] -> [recent window]
-                                                             |
-                                          [per-client writers] -> WebSocket -> clients / relays
+ Postgres 18 ── temporary slot, pgoutput ──> [decode] -> [route: row eval, restrictions]
+      ^                                                       |
+      |  spliced restricted queries (RR, bounded pool)        v
+      +──────────────────────────────── [query workers] <- [units + frontiers]
+                                                              |
+                                          [ops encoded once per unit] -> [unit history]
+                                                              |
+                                           [per-client writers] -> WebSocket / HTTP -> clients
 ```
 
-- **One ordered pipeline goroutine** decodes, routes and encodes, so the
-  hot path has no locks. pgoutput with `binary 'true'` so ints, uuids and
-  timestamps arrive unparsed; rows decode into reusable typed batches.
-  Hot-path rules from `CLAUDE.md` apply: no per-row allocations or maps,
-  pprof before and after.
+- **One loop goroutine** owns all engine state: it routes transactions,
+  applies query results and builds frames, so there are no locks.
 - **Query workers**: a bounded pool (default 4) running spliced queries.
-- **Per-client writers**: one goroutine per socket, reading from the
-  shared window. A slow client never slows the pipeline; one that falls
-  out of the window reconciles.
+- **Per-client writers**: one goroutine per socket. A slow client never
+  slows the loop; one that falls behind its unit's history gets a fresh
+  snapshot.
 - **Boot** has no special path: create a temporary slot, start streaming,
-  then create units and sets lazily as `WANT`s arrive, each by splice. An
-  engine with no clients streams and discards. The epoch is a random id
-  per process start.
-- **Encode once**: a unit's delta for a transaction is one fragment, shared
-  by every client and relay holding the unit.
+  then create units lazily as `WANT`s arrive, each by splice. An engine
+  with no clients streams and discards. The epoch is a random id per slot.
+- **Encode once**: a unit's ops for a transaction are encoded once and
+  shared by every client holding the unit.
+- **Units linger** for the resume window after their last client leaves
+  (at most 10,000 idle units), so a reconnect follows the unit's history
+  instead of re-snapshotting.
 - **Memory is bounded per client and per unit**, never by trusting the
   peer: a client's send queue is capped at 64 MiB (a client that cannot
   keep up is disconnected and reconciles), a unit keeps at most 32 MiB of
-  history (holds lagging behind what was dropped get a fresh snapshot),
-  and one `WANT` names at most 2000 units. Big frames are not built whole:
-  the writer pulls ~1 MiB parts from the shared op bytes while its queue
-  is below 4 MiB.
+  history (holds behind what was dropped get a fresh snapshot), and one
+  `WANT` names at most 2000 units. Big frames are not built whole: the
+  writer pulls ~1 MiB parts from the shared op bytes while its queue is
+  below 4 MiB.
 - **Query results are not copied**: rows are encoded straight into a slab
   per query with their column hashes, and members, snapshot ops and
   frames all reference those bytes.
@@ -561,46 +503,52 @@ optimisation if whole-unit `RESET`s turn out to be common (section 15).
   (a second tab or device, a reconnect storm) needs no query: it gets the
   cached snapshot plus the unit's history since. It is used only when it
   is joinable exactly like a fresh one (the unit is resolved past it and
-  its history reaches back to it); otherwise the client gets a query.
-  `LOCALSYNC_SNAP_CACHE=0` turns it off. Concurrent waiters already share
-  one in-flight query, so the cache matters for staggered arrivals: 20
-  staggered clients on two units need 0 snapshot queries instead of 40
+  its history reaches back to it). Concurrent waiters already share one
+  query, so the cache matters for staggered arrivals: 20 staggered clients
+  on two units need 0 snapshot queries instead of 40
   (`docs/bench/fanout.md`). It holds the result slabs, so it accounts for
   most of the live heap after a big load; set `GOMEMLIMIT` to bound RSS.
 - **A lost replication stream restarts the engine in process**
   (walsender killed, Postgres restarted or failed over, network). Engine
-  state is a cache, so it is dropped: a new slot under a new epoch, setup
-  retried with backoff (250 ms to 10 s) until Postgres is back, queries
-  still in flight discarded. Client sockets stay open; each client gets
-  `RESYNC`, drops any partly received frame, and sends its `WANT` again,
-  which carries the old epoch and so reconciles by checksum exactly like
-  a reconnect. No new correctness path: catalogue 8b and the simulation's
-  `kill walsender` fault cover it.
-- Observability: `/metrics` (Prometheus text, no client library):
-  - Gauges: clients by transport; units, held units and units with
-    pending changes; commit lag (seconds from commit in Postgres to
-    routing, for the last transaction); the furthest-behind client's WAL
-    bytes; the engine's head LSN.
-  - Counters: transactions, row changes, WANTs and refused wants,
-    snapshot queries and cache hits, in-process restarts, messages and
-    bytes sent. Counters stay monotonic across in-process restarts.
-  - Also `/debug/pprof`, `/debug/units` and the rule plan.
-  - All on the engine's own port: put only `/sync` and `/sync/http` behind
-    the public gateway, and scrape the rest privately.
-  - `engine health` checks `/health` for container healthchecks (the image
-    is distroless: no shell, no curl).
+  state is a cache, so it is dropped whole (the `epochState` struct): a
+  new slot under a new epoch, setup retried with backoff (250 ms to 10 s)
+  until Postgres is back, queries still in flight discarded. Then every
+  client connection is closed cleanly (WebSocket close code 1000, or the
+  end of the HTTP response), and clients reconnect at once. Their `WANT`s
+  carry the old epoch and so reconcile by checksum like any reconnect.
+
+**Switches.** Each optimisation can be turned off, which leaves the
+engine computing the same result the slow way. They exist for A/B
+measurement and as safety valves:
+
+| Variable | Off means |
+| --- | --- |
+| `LOCALSYNC_SPLIT=0` | no split: gates are evaluated as subqueries of one unit per principal |
+| `LOCALSYNC_SNAP_CACHE=0` | every join runs a snapshot query |
+| `LOCALSYNC_EQUAL_SKIP=0` | units whose checksum matches on reconnect are resent anyway |
+| `LOCALSYNC_WS_COMPRESSION=0` | no permessage-deflate |
+| `LOCALSYNC_VERIFY=1` | (on) after every resolution, re-evaluate the unit in full and log any difference from its incremental state |
+| `LOCALSYNC_DEBUG=1` | (on) debug logging |
+
+**Observability.** `/metrics` (Prometheus text, no client library):
+
+- Gauges: clients by transport; units, held units and units with pending
+  changes; commit lag (seconds from commit in Postgres to routing, for
+  the last transaction); the furthest-behind client's WAL bytes; the
+  engine's head LSN.
+- Counters: transactions, row changes, WANTs and refused wants, snapshot
+  queries and cache hits, in-process restarts, messages and bytes sent.
+  Counters stay monotonic across in-process restarts.
+- Also `/debug/pprof`, `/debug/units` and the rule plan, all on the
+  engine's own port: put only `/sync` and `/sync/http` behind the public
+  gateway, and scrape the rest privately. `engine health` checks
+  `/health` for container healthchecks (the image is distroless: no
+  shell, no curl).
 
 ## 9. Wire format
 
 One connection per client: a WebSocket, or HTTP where WebSockets fail
-(section 9.1); the messages are the same. Binary messages start with a type byte:
-`1` FRAME, `2` FRAME_PART (a part of a frame; more follow, and the frame
-ends with a FRAME). The client buffers parts and applies the whole frame
-in one transaction, so a big initial load spans many messages but is
-still one change on screen. Messages of 512 bytes or more are compressed with
-permessage-deflate (no context takeover, A15). A unit's ops may be split across parts; its
-fragment flag `continues` says more follow and its checksum is checked
-only on the last piece. Integers are LEB128 varints.
+(section 9.1); the messages are the same.
 
 | Direction | Message | Body |
 | --- | --- | --- |
@@ -608,62 +556,78 @@ only on the last piece. Integers are LEB128 varints.
 | engine | `UNITS` (JSON) | per want: client id, engine ref, rule, table, columns, PK positions; refused wants (`errors`) and failing ones (`failures`), by id |
 | engine | `FAILURES` (JSON) | the failing wants changed: the full list, by id |
 | engine | `SYNCED` (JSON) | caught up on the latest `WANT`: follows the frame that completed it (a response never ends between them) |
-| engine | `SCHEMA` | table descriptors (or changes) at an LSN, before the frame that needs them |
-| engine | `FRAME` | lsn, `[fragment]`; an empty frame just advances the cursor |
+| engine | `FRAME` (binary) | lsn and fragments; an empty frame just advances the cursor |
 | engine | `ERROR` (JSON) | message |
-| engine | `RESYNC` (JSON) | new epoch: the engine restarted in process; send `WANT` again |
 | engine | `BEAT` (JSON) | nothing sent for 15 s; liveness only |
 
-Control messages are JSON text frames (rare, small); only `FRAME` is
-binary. Unit ids are chosen by the client, one per distinct (rule,
+Control messages are rare and small, so they are JSON text; only frames
+are binary. Unit ids are chosen by the client, one per distinct (rule,
 params, principal) and never reused, so a want that changes parameters is
-a new id, and so is the same want for someone else on the same local
-database (section 7).
+a new id, and removals and additions in one frame cannot collide.
+
+A big frame (an initial load) is sent as several `FRAME_PART` messages
+ending with a `FRAME`. The client buffers parts and applies the whole
+frame in one transaction, so a big load spans many messages but is still
+one change on screen. A unit's ops may be split across parts; the
+`continues` flag says more follow, and its checksum is checked only on
+the last piece.
 
 ```
-fragment = unit_ref len ops
-ops      = (table_id count op*)*
-op       = PUT row | REMOVE pk | PATCH patch | RESET
-patch    = u64 row hash | len pk | changed bitmap | null bitmap | changed values
-row      = null_bitmap value*          positional, the unit's columns
+message  = type lsn count fragment*        type: 1 FRAME, 2 FRAME_PART
+fragment = ref flags checksum count op*    flags: RESET, CONTINUES; checksum: u64 LE
+op       = kind len body                   PUT row | REMOVE pk | PATCH patch
+patch    = u64 row hash | pk | changed bitmap | null bitmap | changed values
+row      = null bitmap, value*             positional, the unit's columns
 ```
 
-Values are typed by the descriptor, never self-describing: zigzag
-varints, `bool` in the bitmap, `uuid` 16 bytes, `timestamptz` int64 µs,
-`date` as its text form (`2026-07-03`, as the Electric path stores it), `float8` 8 bytes, `numeric` as text, `text`/`bytea`
-length-prefixed, `json`/`jsonb` as text, arrays as count + elements,
+Integers are LEB128 varints. Values are typed by the unit's column
+descriptor, never self-describing: zigzag varints, `bool` in the bitmap,
+`uuid` 16 bytes, `timestamptz` int64 µs, `date` as its text form
+(`2026-07-03`), `float8` 8 bytes, `numeric` as text, `text`/`bytea`
+length-prefixed, `json`/`jsonb` as text, arrays as count and elements,
 anything else (PostGIS `geometry`, pgvector `halfvec`) as its text form
-unless projected away. PUT always carries the full projected row.
+unless projected away.
+
+`PATCH` carries only the columns whose hash changed, plus the new row
+hash, so the client needs no row bytes to verify it. A one-int update of
+a 12 kB row is 49 bytes. Resolutions always send `PUT`: a `PATCH` is
+relative to the unit's own history, and resolutions are what bring
+clients that joined mid-gap onto that history.
+
+Messages of 512 bytes or more are compressed with permessage-deflate,
+without context takeover. Initial loads and move-ins shrink about 40%;
+small deltas would grow about 10%, so they go out as they are. Context
+takeover would shrink them another 35% but keeps a compressor per
+connection (hundreds of kB in Go), too much at thousands of sockets
+(`docs/bench/deflate.md`).
 
 ### 9.1 Transports
 
-- **WebSocket** (`/sync`) is the default. A WANT on the open socket
-  changes the wanted set or refreshes the token.
+- **WebSocket** (`/sync`) is the default. Each connection carries one
+  `WANT` (section 7).
 - **HTTP** (`/sync/http`) is the same protocol for networks where
   WebSockets fail: proxies that strip `Upgrade`, cut long-lived sockets,
   or hold responses until they are complete (antivirus and DLP proxies).
-  - Each request is a connection. Its body is one WANT. Its response
+  - Each request is a connection. Its body is one `WANT`. Its response
     streams the engine's messages as records: a kind byte (0 text, 1
     binary, `0x80` set when the payload is raw deflate), the length as 4
     bytes little-endian, the payload.
-  - Records of 512 bytes or more are deflated alone, as A15 does on the
-    WebSocket. The response is `application/octet-stream`, so gateways'
-    `gzip_types` leave it alone. Compressing inside the protocol works
-    even where a gateway strips `Accept-Encoding` before forwarding.
-  - A stream ends after 5 minutes. A new WANT (new wants, a fresh token)
+  - Records of 512 bytes or more are deflated alone. The response is
+    `application/octet-stream`, so gateways' `gzip_types` leave it alone,
+    and compression works even where a gateway strips `Accept-Encoding`.
+  - A stream ends after 5 minutes. A new `WANT` (new wants, a fresh token)
     is a new request. Either way the client re-POSTs at once and resumes
-    from its cursor, which is the WebSocket reconnect path (A16) and
-    costs about a millisecond.
+    from its cursor, which costs about a millisecond.
   - `?mode=poll` ends the response after the first frame with unit data,
     or after 20 s. Behind a proxy that buffers whole responses, every
-    long poll still delivers, and with no extra latency: the response
-    ends the moment there is something to send.
+    long poll still delivers, with no extra latency: the response ends
+    the moment there is something to send.
   - The engine sends `X-Accel-Buffering: no` (nginx then streams even
     where `proxy_buffering` is on), `Cache-Control: no-store,
     no-transform`, and `Access-Control-Allow-Origin: *`. The token is in
     the body, never a cookie, and a plain-text body needs no CORS
     preflight.
-- **Choosing** (`SyncClientOptions.transport`, default `auto`):
+- **Choosing** (`transport`, default `auto`):
   - The client starts on WebSocket. Two WebSocket attempts in a row that
     never deliver a message switch it to HTTP streaming.
   - A stream with no message within 5 s is being held back by a proxy:
@@ -675,23 +639,26 @@ unless projected away. PUT always carries the full projected row.
     minutes.
 - **Liveness**: the engine sends `BEAT` on any connection idle for 15 s,
   because nginx's default `proxy_read_timeout` (60 s) closes idle proxied
-  WebSockets (measured: closed at 60.1 s without beats). The client
-  treats 45 s without any message, or 10 s without an answer to WANT, as
-  a dead connection and reconnects.
+  WebSockets. The client treats 45 s without any message, or 10 s without
+  an answer to `WANT`, as a dead connection and reconnects.
+- **No WebTransport.** Its benefits are separate streams, connection
+  migration and 0-RTT; localsync delivers one ordered stream per client
+  by design, and a resume already costs about a millisecond. UDP is often
+  blocked on enterprise networks, so it would need the HTTP fallback
+  anyway.
 
 ## 10. Client
 
 ### 10.1 localdb `SyncTransport`
 
-Implemented as below with one change: localdb does not import localsync.
-localdb exports `registerSyncTransport(name, factory)` from its writer
-worker module; the app's writer worker entry registers localsync, and
-`LocalDbConfig.sync = { transport: 'localsync', options: { url, tokenUrl,
-wants } }` (structured-cloneable) selects it. The transport's database
-access goes through `ctx.run(fn)`, which localdb executes inside its write
-fence, so frames commit exactly like Electric batches and broadcast the
-same commit notices. `LocalDb.syncCommand({ want })` changes the wanted set
-(e.g. a project switch).
+localdb does not import localsync. It exports `registerSyncTransport(name,
+factory)` from its writer worker module; the app's writer worker entry
+registers localsync, and `LocalDbConfig.sync = { transport: 'localsync',
+options: { url, tokenUrl, wants } }` (structured-cloneable) selects it.
+The transport's database access goes through `ctx.run(fn)`, which localdb
+executes inside its write fence, so frames commit exactly like any other
+sync batch and broadcast the same commit notices.
+`LocalDb.syncCommand({ want })` changes the wanted set (a project switch).
 
 Status, as localdb's `SyncStatus`:
 
@@ -702,44 +669,23 @@ Status, as localdb's `SyncStatus`:
 | `error` | the connection closed: the actual reason (`token endpoint 401`, `no answer to WANT`, ...), the real retry delay, and the token endpoint's `httpStatus` when that is what failed |
 | `failed` | after `live`, some wants are not served: name, error and `permanent` (refused) per want; everything else is live |
 
-`error` is a blip the transport retries; `failed` with a permanent
-failure is a client and rules mismatch (a deploy skew, a bug) that the
-app should show. Before v0.1.1 every failure became `error: connection
-closed, retry in 250ms`.
-
-Original sketch:
-
-localdb hard-wires Electric today: one `shapeStream` per table, cursors in
-`_ldb_shape`, tags in `_ldb_row_tag`, and `alignShapes` as a partial
-workaround for cross-shape tearing. Phase 6 adds an interface owned by
-the writer worker, with Electric (unchanged code) and localsync as
-implementations:
-
-```ts
-export interface SyncTransport {
-	start(ctx: SyncContext): void
-	stop(): Promise<void>
-	want?(wants: Want[]): Promise<void>
-	waitFor?(marker: string): Promise<'visible' | 'not-visible'>
-}
-
-export interface SyncContext {
-	// One fenced write transaction and one commit notice; the transport
-	// stores its cursor through tx inside it.
-	transaction<T>(fn: (tx: SyncTx) => T): T
-	status(s: SyncStatus): void
-	signal: AbortSignal
-}
-```
+`error` is a blip the transport retries. `failed` with a permanent
+failure is a mismatch between client and rules (a deploy skew, a bug)
+that the app should show.
 
 ### 10.2 Apply
 
 ```sql
 CREATE TABLE _lsync_member (
-	unit INTEGER NOT NULL, tbl INTEGER NOT NULL, pk BLOB NOT NULL, hash INTEGER NOT NULL,
-	PRIMARY KEY (unit, tbl, pk)
+	unit INTEGER NOT NULL, tbl TEXT NOT NULL, pk TEXT NOT NULL, hash TEXT NOT NULL,
+	PRIMARY KEY (unit, pk)
 ) WITHOUT ROWID;
 CREATE INDEX _lsync_member_row ON _lsync_member (tbl, pk);
+-- One row per unit definition (rule, params, principal); checksum NULL:
+-- the next WANT does not claim the unit (new, dropped or drifted).
+CREATE TABLE _lsync_unit (id INTEGER PRIMARY KEY, def TEXT NOT NULL UNIQUE, checksum TEXT);
+-- How rows of each synced table are keyed, to delete them by key.
+CREATE TABLE _lsync_table (tbl TEXT PRIMARY KEY, pk_cols TEXT NOT NULL);
 ```
 
 - A frame (all parts) is one SQLite transaction, held open across parts
@@ -747,15 +693,20 @@ CREATE INDEX _lsync_member_row ON _lsync_member (tbl, pk);
   the cursor and unit checksums written inside it.
 - `PUT`: upsert row and membership. `REMOVE`: drop membership. `RESET`:
   drop all memberships of the unit. At commit, rows with no membership
-  left are deleted.
+  left are deleted, so overlapping rules on one table (an admin rule and
+  a member rule) need no dedupe.
+- The first frame after a `UNITS` message drops the memberships of every
+  unit not in it, inside that frame's transaction.
+- Long runs of `PUT`s (snapshots, big move-ins) take a set-based path
+  that reads the previous member hashes per chunk: 20,000 rows in 215 ms.
 - Row hashes and unit checksums are unsigned 64-bit and stored as
-  decimal text: sqlite-wasm reads `INTEGER` columns into JS numbers. Every
-  fragment carries the unit checksum after it; a mismatch drops the unit
-  from `have` and reconnects, so the engine re-sends it whole.
+  decimal text, because sqlite-wasm reads `INTEGER` columns into JS
+  numbers. Every fragment carries the unit checksum after it; a mismatch
+  clears the unit's stored checksum and reconnects, so the engine resends
+  it whole.
 - sqlite-wasm binds any JS number passing `Number.isInteger` as int64, so
   a double like `1e300` would be stored as `0`; such values are bound as
-  text, which a `REAL` column converts exactly (found by catalogue 1). Overlapping rules on one table (an admin rule and a
-  member rule) need no client-side dedupe.
+  text, which a `REAL` column converts exactly.
 - Decoding is positional: one prepared statement per (table, columns),
   per-column decoders resolved once.
 - Local DDL stays app-owned: descriptor columns are mapped by name,
@@ -765,39 +716,41 @@ CREATE INDEX _lsync_member_row ON _lsync_member (tbl, pk);
 
 G2 ends at the SQLite commit. For the screen, localdb must also deliver
 all live query results of one commit together. By default it does not:
-live queries are spread over the reader pool by table, each reader re-runs
-its own on its own tick, so one render can show a task at a new commit and
-its comments at an older one. The collab soak (`docs/bench/collab.md`: two
-people editing at ~78 transactions/s) measured **93% of render turns torn**
-that way. localdb's opt-in `alignCommits` (A20) puts every live query on
-one reader: a tick reads them all in one snapshot (fence reads) and posts
-them in one message, delivered in one render. Measured: 0 torn renders in
-2 minutes, commit-to-render 65 ms p50 (59 ms without), one-shot queries
-still on the whole pool. App A keeps tenant-level and per-project data in
-separate files with no cross-file queries (A19), so per-file alignment is
-all it needs.
+live queries are spread over the reader pool by table, and each reader
+re-runs its own on its own tick, so one render can show a task at a new
+commit and its comments at an older one. The collab soak
+(`docs/bench/collab.md`: two people editing at about 78 transactions/s)
+measured 93% of render turns torn that way. localdb's opt-in
+`alignCommits` puts every live query on one reader: a tick reads them all
+in one snapshot and posts them in one message, delivered in one render.
+Measured: 0 torn renders in 2 minutes, commit-to-render 65 ms p50 (59 ms
+without), one-shot queries still on the whole pool. Alignment is per
+database file, so data that must render together belongs in one file.
 
 ## 11. Auth
 
-The app server mints a short-lived JWT (`sub`, `exp`, app claims; HMAC or
-JWKS), refreshed by sending `WANT` with a new token before expiry. Expired
-without refresh: frames stop, then the socket closes. Forged or expired
-tokens are rejected at the first `WANT`. Each `WANT` re-resolves units,
-so changed claims revoke or add units through the normal frame path. The
-engine is the only place visibility is decided; relays never interpret
-rules.
+The app server mints a short-lived JWT, refreshed by sending `WANT` with
+a new token before expiry. Expired without refresh: frames stop, then
+the connection closes. Forged or expired tokens are rejected at the first
+`WANT`. Each `WANT` re-resolves units, so changed claims revoke or add
+units through the normal frame path. The engine is the only place
+visibility is decided.
 
 Tokens are HS256 only, with `exp`, `sub` and the deployment's `aud`
 required (`alg: none`, other algorithms and string `grants` are refused).
+The audience is per deployment: with one engine per tenant database and
+a shared secret, a token for one tenant must not open another's engine.
 `$sub` always comes from the token: a client parameter named like an
-undeclared one is refused. What an attacker can pin is bounded:
+undeclared one is refused.
+
+What an attacker can pin is bounded:
 
 | Limit | Value | Past it |
 | --- | --- | --- |
 | Time to a valid `WANT` (WebSocket), to the `WANT` body (HTTP) | 10 s | connection closed |
 | Message size | 1 MiB | connection closed |
 | Wants per connection | 2,000 | want refused |
-| New wants per connection | 4,000 at once, then 2,000 a minute | want refused, ask again later |
+| New units per principal, across connections (joining a unit that exists is free) | 4,000 at once, then 2,000 a minute | want refused, ask again later |
 | Parameter value | 4 KiB, no NUL | want refused |
 | Units no client holds (the resume cache) | 10,000 | oldest dropped early |
 | Bytes queued for one slow client | 64 MiB | connection closed |
@@ -805,458 +758,131 @@ undeclared one is refused. What an attacker can pin is bounded:
 Client parameters reach Postgres through pgx's simple protocol and row
 values through `rules.Literal`; both depend on
 `standard_conforming_strings`, which the engine sets on every connection.
-`/debug/*`, `/metrics` and pprof share the listener: expose only `/sync`
-and `/sync/http` through the gateway.
 
 ## 12. Postgres footprint
 
-PG 18 only (both apps; App A upgrades from 17.4).
+Postgres 18 only.
 
 - **Temporary logical slot** (`CREATE_REPLICATION_SLOT ... TEMPORARY
   LOGICAL pgoutput`). Postgres drops it when the engine's replication
   connection ends, so a dead or deploying engine never pins WAL, and
-  there is no slot loss to recover from. Price: a dropped replication
-  connection means a cache-cold restart (clients reconcile). The restart
-  happens inside the process (section 8): sockets stay open. A permanent
-  slot is an optimisation (section 15).
+  there is no slot loss to recover from. The price: a dropped
+  replication connection means a cache-cold restart, inside the process
+  (section 8), and clients reconcile.
 - **Publication** `localsync`, `FOR TABLE` exactly the tables rules
-  reference, all four operations, `publish_via_partition_root = true`, no
-  row filters or column lists (plan decision 12). Coexists with
-  Electric's publication during migration.
-- **`REPLICA IDENTITY FULL`** on every published table: old rows for exact
-  row-local moves without leaking PKs, incremental checksums, and filling
-  unchanged TOAST columns. Cost is WAL volume on updates and deletes, to be
-  measured on both apps' write mixes (A8).
-- **`sync` schema** (SQL only):
+  reference, no row filters or column lists. It coexists with other
+  publications.
+- **`REPLICA IDENTITY FULL`** only where old values are read: tables
+  inside some rule's subqueries (restriction values, column pruning). A
+  rule's own table keeps its identity, because units keep per-column
+  hashes, and FULL logs the whole detoasted old row on every update (up
+  to 200 times the WAL per update on rows with large out-of-line values,
+  `docs/bench/dense.md`). An unchanged TOAST column of a member keeps its
+  stored value; a row entering a unit with an unsent value is fetched by
+  key. Identity is never downgraded, so another consumer's FULL survives.
+- **`sync` schema**: one table, `sync.fence (id int PRIMARY KEY, n bigint
+  NOT NULL)`, for fences (section 5).
+- **Read-your-writes is an app convention, not protocol**: the app writes
+  `(client_id, last_mutation_id)` in its own transaction and the client
+  wants a rule over its own row. The confirmation then arrives in the same
+  atomic frame as the data. There is no `WAIT` message.
+- Recommended backstops for other slots on the same database:
+  `max_slot_wal_keep_size` and `idle_replication_slot_timeout`.
 
-  ```sql
-  CREATE SCHEMA IF NOT EXISTS sync;
-  CREATE TABLE IF NOT EXISTS sync.fence (id int PRIMARY KEY, n bigint NOT NULL);
-  ```
+## 13. Verification
 
-  When a query result waits for the stream to pass its snapshot LSN and
-  nothing else is committing, the engine updates `sync.fence` and waits to
-  see it in the stream: a **fence**, written only on demand. Read-your-
-  writes is the A13 convention (a `client_mutation` row written in the
-  app's transaction, synced by a rule), so there is no `write_marker()`
-  and no `WAIT` message.
-- Docs recommend `max_slot_wal_keep_size` (for Electric's slot during
-  migration) and `idle_replication_slot_timeout` (PG 18) as backstops.
+Capability tests assert what the client can observe, compared with the
+oracle (the rule SQL run directly in Postgres), never protocol details.
 
-## 13. Relays
+**Capability harness** (`ts/harness`). Run it over both transports
+(`LOCALSYNC_TRANSPORT=http` too): their connections differ, and so do the
+paths a reconnect takes through the engine. A scenario is a TS module: schema
+SQL, seed, principals, rules as SQL, and steps (write, connect, want,
+disconnect, restart, quiesce, expect oracle), plus optional samplers run
+after every local commit: *no partial transaction* (each workload
+transaction stamps one fresh tag on rows in several tables; a tag present
+anywhere must be complete) and *no row outside visibility* (every replica
+row is in the oracle at some LSN in the client's window). The oracle
+compares in canonical form (timestamps as µs, numerics as decimal text,
+jsonb with sorted keys). The reference client is localdb's real code on
+in-memory sqlite-wasm in Node, so it tests what apps ship. Results:
+`docs/capability-matrix.md`; the same catalogue against Electric 1.7.9,
+measured before localdb dropped Electric: `docs/electric-comparison.md`.
 
-A relay is a client of the union of its clients' units plus fan-out: it
-sends one `WANT` upstream for the union, forwards each client's token to
-the engine for authorisation, keeps per-client frontiers (the same `min`
-rule), and assembles each client's frames from upstream fragments by
-`unit_ref` without decoding rows. Optional: single-node deployments
-connect clients to the engine directly with the same protocol. Relays
-speak WebSocket only; clients that need HTTP (section 9.1) connect to
-the engine.
+**Smash simulation** (`sim/`). Seeded workloads with many clients:
+hot keys, link churn, rows flapping in and out of visibility, clients
+joining, switching projects and leaving, and with `--faults` engine kills
+and walsender kills. Every client's state is checked against the oracle
+at checkpoints and after quiesce. `parallel` runs many seeds at once, each
+with its own database and engine.
 
-## 14. Verification: harness and simulation
+**Differential checking.** `LOCALSYNC_VERIFY=1` re-evaluates every unit
+in full after each resolution and logs any difference from its
+incremental state: the fast paths checked against the definition.
 
-### 14.1 Capability harness (`ts/harness`)
+**Browser.** `ts/browser` runs real localdb in headless Chrome with OPFS
+and workers: an initial load, two-table transactions that a reactive
+query must never render torn, and a want change through `syncCommand`.
+The collab soak measures torn renders and latency per tab with two people
+editing.
 
-Tests capabilities, never protocol details. A scenario is a TS module:
-schema SQL, seed, principals, rules as SQL, and steps (write, connect,
-want, disconnect, restart, quiesce, expect oracle), plus optional
-continuous samplers.
+**Through a TLS gateway.** `docker/gateway` is nginx configured like a
+production gateway: HTTP/2 and HTTP/3, gzip on, nginx's default proxy
+timeouts and buffering, and a real certificate for a name that resolves
+to 127.0.0.1. `LOCALSYNC_URL` and `LOCALSYNC_TRANSPORT` route the harness
+and simulation through it; `LOCALSYNC_BROWSER_VIA=gateway|hostile` does
+the same for the browser runs. The gateway check loads 2,000 tasks and
+comments, idles 75 s, then times updates:
 
-- **Oracle**: each wanted rule run against Postgres with the principal's
-  params, unioned per table, compared in canonical form (timestamps as µs,
-  numerics as decimal text, jsonb with sorted keys).
-- **Adapters**: Electric (rules converted to `table`/`where`/`columns`;
-  anything that does not fit is `unsupported`) and localsync. Interface as
-  in the plan: `configure`, `connect`, `replica`, `quiesce`,
-  `disconnect`, `reconnect`, `restartServer`, `bytesTransferred`,
-  optional `awaitWrite`, `want`.
-- **Reference client**: localdb's actual client code (`sync/electric.ts`,
-  `sync/apply.ts`, later the localsync transport) on in-memory sqlite-wasm
-  in Node, as localdb's own tests already run it, so the baseline
-  measures what the apps ship (A12).
-- **Samplers**, run after every local commit: *no partial transaction*
-  (each workload transaction stamps one fresh tag on rows in several
-  tables; a tag present anywhere must be complete), *no row outside
-  visibility* (every replica row is in the oracle at some LSN in the
-  client's window).
-- **Fixture schema**: direct scope column, 1 hop, many-to-many, multi-hop,
-  a self-referencing link, and a table with every type (uuid,
-  timestamptz, jsonb, arrays, bool, numeric, NULLs, TOAST-sized text).
-  Corpus mode runs both apps' real schemas and rules on generated data.
-- **Catalogue**: the plan's 15 capabilities, plus: Electric's behaviour
-  when a table with a live shape is dropped and recreated (seen in Phase
-  0), a project switch as one atomic swap, and a permission-scoped
-  `project` rule. Baseline matrix in `docs/capability-matrix.md`.
+| Case | Mode | Load | Update p50 |
+| --- | --- | --- | --- |
+| WebSocket over WSS | WebSocket | 153 ms | 2 ms |
+| HTTP streaming over HTTPS | stream | 97 ms | 2 ms |
+| `auto` through the gateway | WebSocket | 152 ms | 2 ms |
+| `auto` through a hostile middlebox | poll | 5,350 ms | 3 ms |
 
-### 14.2 Smash simulation (`sim/`)
+The middlebox refuses WebSocket upgrades and holds every response until
+it is complete. A reload on the same database resumes in poll mode in
+39 ms.
 
-- Seeded workloads (hot keys, 100k-row transactions, link churn, rows
-  flapping in and out of visibility, clients joining, switching and
-  leaving), random rules from the FK graph (SQLancer-style, NULL-heavy,
-  with ternary-logic-partitioning metamorphic checks), faults (`kill -9`,
-  Postgres restart, replication connection drops, toxiproxy, slow
-  readers).
-- Invariants: replica == oracle after quiesce, both samplers above,
-  client checksums == engine checksums.
-- **Differential checking is free**: every fast-path delta (strategies 1
-  and 2) can be recomputed by its restricted query (strategy 3) and
-  compared. The simulation does it for every delta; production can do it
-  for a sample, using the same code path.
-- Leaks (goroutines, heap, FDs, Postgres connections back to baseline
-  after soak), `-race`, `go test -fuzz` on the pgoutput decoder and wire
-  codec, fuzzed TS decoder.
-- Shrinking: delta-debug failing op sequences; interleavings are not
-  deterministic, so each candidate runs several times.
+**Hostile suite.** Attacks a running engine on purpose. Leak attacks are
+checked against the oracle: injection-shaped client parameters on every
+parameterised rule, injection-shaped principals with text primary keys,
+and stored values that reach restriction SQL through a text join.
+Raw-socket attacks: forged and malformed tokens, undeclared parameters,
+malformed, binary and oversized messages. Exhaustion: 500 connections
+that never authenticate, and one client churning through 40,000 new
+units. After each, the engine must still answer `/health`.
 
-### 14.3 Through a TLS gateway
+**Security checks.** `scripts/security.sh` runs govulncheck, staticcheck,
+gosec and `pnpm audit`, then every Go fuzzer briefly (`FUZZTIME`): the
+wire codec and patch decoder, restriction SQL (row values must parse back
+as exactly those string constants) and client parameters through the
+simple protocol against Postgres. The tools are pinned in `tools/go.mod`.
 
-`docker/gateway` is nginx configured like the apps' gateways: HTTP/2 and
-HTTP/3, gzip on, nginx's default proxy timeouts and buffering. It serves
-a real certificate for a name that resolves to 127.0.0.1, so tests run
-over `wss://` and `https://` exactly as browsers reach the apps.
+**Benchmarks** (`docs/bench/`): initial load time and bytes, change
+latency, bytes per change, move-ins, fan-out and deflate. Reports from
+before localdb dropped Electric include its numbers.
 
-- **Harness and simulation**: `LOCALSYNC_URL` and `LOCALSYNC_TRANSPORT`
-  route every client through it. The catalogue passes 23/23 over WSS
-  through nginx, and 23/23 over HTTP streaming and over long polls
-  (before catalogue 15b was added).
-  20/20 fault-simulation seeds pass over HTTP.
-- **`pnpm ... gateway`** checks four cases, each with a load of 2,000
-  tasks and comments, 75 s idle, then timed updates:
+## 14. Not built yet
 
-  | Case | Mode | Load | Update p50 |
-  | --- | --- | --- | --- |
-  | WebSocket over WSS | WebSocket | 153 ms | 2 ms |
-  | HTTP streaming over HTTPS | stream | 97 ms | 2 ms |
-  | `auto` through the gateway | WebSocket | 152 ms | 2 ms |
-  | `auto` through a hostile middlebox | poll | 5,350 ms | 3 ms |
+Each is a cache or a shortcut over the core, adopted only when a
+measurement asks for it.
 
-  - The first three survive 75 s idle without a reconnect.
-  - The middlebox refuses WebSocket upgrades and holds every response
-    until it is complete. The hostile load is slow only the first time:
-    a reload on the same database resumes in poll mode in 39 ms.
-- **Browser**: `LOCALSYNC_BROWSER_VIA=gateway` (or `hostile`) serves the
-  smoke and the collab soak from one `https://` origin through the
-  gateway. All four cases pass, with 0 torn renders on aligned tabs.
-
-### 14.3a Hostile suite and security checks
-
-`pnpm --filter @nightride/localsync-harness hostile` attacks a running
-engine on purpose. Leak attacks are checked against the oracle:
-injection-shaped client parameters on every parameterised rule,
-injection-shaped principals (token `sub`) with text primary keys, and
-stored values that reach restriction SQL through a text join. Raw-socket
-attacks: forged and malformed tokens, undeclared parameters (`sub`),
-malformed, binary and oversized messages. Exhaustion attacks: 500
-connections that never authenticate, and one client churning through
-40,000 new units. After each, the engine must still answer `/health`.
-
-`scripts/security.sh` runs govulncheck, staticcheck, gosec and
-`pnpm audit`, then every Go fuzzer briefly (`FUZZTIME`): the wire codec
-and patch decoder, restriction SQL (row values must parse back as exactly
-those string constants) and client parameters through the simple protocol
-against Postgres. The tools are pinned in `tools/go.mod`.
-
-### 14.4 Benchmarks
-
-Both engines: initial load time and bytes, change latency p50/p99,
-bytes per change, reconnect bytes after a deploy, engine CPU/RSS at N
-clients, Postgres load from splices. Results in `docs/bench/`.
-
-## 15. Optimisation slate
-
-Each is a cache or shortcut over the core; none changes semantics, and
-each is adopted only when a benchmark asks for it.
-
-| Optimisation | Buys | Trigger |
+| Idea | Buys | Build when |
 | --- | --- | --- |
-| maintained sets (strategy 2) | inserts and link-table changes without restricted queries; move-ins still need a query for row content | inserts or grants dominate latency; after column pruning they are at parity with or ahead of Electric (`docs/bench/`), so deferred |
-| snapshot-apply bulk path (client) | initial load | done in Phase 4: 1.5 s -> 0.47 s for 20k rows |
-| bucketed checksums | resync sends only differing buckets | whole-unit `RESET`s common after restarts |
-| persistent slot + checkpoints | restart without re-reading units | splice load after deploys too high |
-| disk transaction log | catch-up without re-reading for long-offline clients | same |
-| splices on a physical replica | no snapshot load on the primary | Postgres load measured too high |
-| `permessage-deflate` | fewer bytes on loads and move-ins | **done** (A15) |
-| per-fragment zstd / trained dictionary | fewer bytes on small deltas | bytes per change matter after A15 |
-| column-delta PUTs | fewer bytes on wide rows | **done** (A9) |
-| chunked snapshot delivery | bounded engine memory on big initial loads | **done**: frames go out in ~1 MiB parts; RSS after a ~110 MB load 485 -> 407 MB, the rest is the snapshot cache and GC headroom (`docs/bench/dense.md`) |
-| zero-copy query results | no per-row copies between query, members and frames | **done** |
-| snapshot cache | joins to warm units without queries | **done** (section 8) |
-| in-memory row cache per unit | move-ins without queries | move-in latency |
+| maintained sets (tier 2 in memory) | inserts and link changes without restricted queries; move-ins still need a query for row content | inserts or grants dominate latency (today at parity with or ahead of Electric) |
+| batched restricted queries (`LATERAL` over the units' parameters) | one query instead of one per unit when analysis cannot narrow the units | many units of one rule are affected per write |
+| bucketed checksums | resync sends only differing buckets | whole-unit `RESET`s are common after restarts |
+| persistent slot and checkpoints, or a disk log | restart and long-offline catch-up without re-reading units | snapshot load after deploys is too high |
+| splices on a physical replica | no snapshot load on the primary | Postgres load is too high |
+| per-fragment zstd or a trained dictionary | fewer bytes on small deltas | bytes per change matter |
+| in-memory row cache per unit | move-ins and joins without queries | move-in latency |
+| priority classes (one frontier per class) | core data never waits behind a heavy table | head-of-line blocking shows up |
+| fan-out relays | many clients per engine | one engine's connections or CPU run out |
+| deferred indexes on big loads (drop a table's secondary indexes before a large load into it, recreate them after, inside the frame's transaction) | in-memory with 8 indexes: 15 to 21% of load time (100k rows: 1.2 s to 0.95 s) | a load on OPFS with an app's real schema is too slow |
 
-## 16. Phases
-
-Status as of 2026-10-30: 0 to 4 done; 6 started (localdb transport,
-`alignCommits`, HTTP fallback and gateway checks done); 5 not started.
-
-0. Skeleton, compose, this document. **Done.**
-1. Harness + Electric baseline (section 14.1), first benchmarks.
-   **Done**: `docs/capability-matrix.md`, `docs/bench/`.
-2. Corpus check: print section 4.3's tables mechanically for both
-   corpora; any surprise is raised with the user. **Done** (results kept
-   with the private corpus), no surprises.
-3. **Done** (except per-fragment compression, priority classes and an
-   in-engine differential verifier). Correct core: temporary slot and pgoutput decode, splice with regular
-   snapshots, units and frontiers, restrictions with strategies 1 and 3
-   (every rule correct, link changes via restricted queries), reconcile,
-   recent window, checksums, `sync` schema, JWT, wire codec. Pass the
-   catalogue; simulation with differential checking from the first commit.
-4. Strategy 2 (maintained, shared sets), as far as benchmarks justify.
-   **Done as far as justified**: column pruning, fence-free resolution
-   when no WAL follows the last routed commit, and bulk snapshot apply
-   closed every benchmark gap; maintained sets are on the slate with a
-   trigger (section 15).
-5. Relays, priorities, the optimisation slate as measured.
-6. localdb `SyncTransport` and commit-aligned delivery, then App B behind
-   a per-user flag next to Electric with replica diffing, then App A.
-   **localdb transport done, uncommitted in `../localdb`**:
-   `src/sync/transport.ts` (interface + `registerSyncTransport`),
-   `LocalDbConfig.sync`, `LocalDb.syncCommand`, and the writer worker
-   running a registered transport inside its write fence; localdb's 9 test
-   files pass. The localsync side is `localsyncTransport`
-   (`ts/transport/src/localdb.ts`). `ts/browser` is an end-to-end smoke in
-   headless Chrome: real localdb with OPFS and workers, initial load, 120
-   two-table transactions never rendered torn by a reactive query, and a
-   want change through `syncCommand`. Not done: commit-aligned delivery
-   in localdb (Q8), App A / App B integration (needs the user).
-
-## 17. What implementation changed
-
-Things the plan or earlier drafts of this document did not anticipate,
-each found by building or by the harness:
-
-- **Resolution gaps and snapshot rounds** (section 6): `min(known)` is
-  not a safe frontier once units resolve by query; frames must avoid each
-  unit's gap, and rounds sharing one exported snapshot keep frontiers
-  moving.
-- **Unit gates** (section 3.2a): uncorrelated `EXISTS` gates keep gated
-  rules on the fast path; without them all of App A's project rules
-  would need a query per write.
-- **Full re-evaluation is the universal fallback**: a restricted query
-  that misses a restriction (a transaction committed before its boundary
-  but routed after it was issued) is retried as a full evaluation, which
-  always resolves because it covers everything up to its own boundary.
-- **Units linger** for the resume window after their last client leaves,
-  otherwise every reconnect re-snapshots (catalogue 7 failed until then).
-- **Client-chosen unit ids** (section 9), never reused, so removals and
-  additions in one frame cannot collide.
-- **Read-your-writes needs no protocol** (A13): the harness's catalogue 13
-  passes on localsync with a `client_mutation` row and fails on Electric
-  because the confirmation arrives on a different stream than the data.
-- **Client fixes the baseline exposed**, all in localdb's Electric path or
-  sqlite-wasm, not in Electric itself: `pgArrayToJson` turns `'1'` in a
-  `text[]` into the number 1 (catalogue 1); a column added upstream wedges
-  the shape (`no column named ...`, catalogue 12b); sqlite-wasm stores a
-  bound `1e300` as 0. localsync's codec avoids all three.
-- **Fences are only needed when WAL follows the last routed commit**: if
-  a query's snapshot LSN is at or before the end of the last routed commit
-  record, every commit before it has been streamed.
-- **A held unit that is no longer wanted is the client's to drop**: the
-  smash simulation found a client that swapped projects, disconnected
-  before the removal frame, and kept the old unit's rows forever (also
-  deletes upstream never reached them). Catalogue 17 covers it.
-- **Fuzzing found two codec bugs in seconds**: Go escapes for invalid
-  UTF-8 and non-JSON numbers (`000000`, `NaN`) in arrays.
-- **The browser smoke catches what Node cannot**: a drift diagnostic used
-  `Buffer`, which exists in Node (so the harness and simulation passed)
-  but not in a browser worker, where every frame failed to apply. Lint
-  now forbids Node globals in `ts/transport/src`.
-- **Waiting clients already share one snapshot query**, so a cache only
-  helps clients that arrive after the query finished (section 8).
-- **Switching away from a project and straight back** hid two bugs:
-  - **Engine** (section 7): a `WANT` resumed units on the strength of
-    haves the client wrote before applying a frame that removed them.
-    The client ended up with an empty unit the engine believed full,
-    found while chasing the next bug and made deterministic as
-    catalogue 15b. Haves now count only on a connection's first `WANT`.
-  - **Client**: a removal deleted the unit's `_lsync_unit` row, which is
-    also the definition's id. The `WANT` that wanted the unit back was
-    already sent under that id, so the unit's checksum was never stored
-    again, and its next delta read as drift. The smash simulation found
-    it (seed 213, only under four parallel jobs). Removals now mark the
-    unit not held (`apply.test.ts` replays the ordering).
-- **Local state belongs to a principal**: App B's shadow comparison
-  signed users in one after another in one browser, sharing one local
-  database file. Units named by (rule, params) took one curator's synced
-  state for the next curator's, and the engine resumed it (its units were
-  warm). Electric avoided it only because App B's proxy puts the user id
-  into each shape's `where`. Units are now named per principal (section
-  7, catalogue 7b).
-- **nginx closes idle WebSockets at 60 s** (`proxy_read_timeout`), which
-  is the default on most routes an app would mount the engine on. Hence
-  the `BEAT` messages (section 9.1).
-- **nginx's `proxy_buffering` does not hold a stream**: it still forwards
-  data as it arrives. The hostile case needs a real holding proxy
-  (`ts/harness/src/middlebox.ts`).
-- **The gateway exposed a race in localdb**: in `multi` mode a reader
-  opened its connection outside the read fence. When the first sync
-  frame landed while readers booted, a torn header read poisoned the
-  reader for good (`SQLITE_CORRUPT` on every query, since fence mode
-  never reopens). It failed 9 of 18 browser runs through the gateway
-  and 0 direct, where the timing differs. The open now takes the fence:
-  0 of 9 failed (`reader.worker.ts`, uncommitted in `../localdb`).
-
-## Decisions
-
-Agreed with the user on 2026-10-29, amending the plan where noted.
-
-- **A1. The four-idea core** (section 2) replaces separate mechanisms for
-  snapshots, move-ins, holds, resync, priorities and subscribe.
-- **A2. Engine state is a cache; no disk log or checkpoints in v1.**
-  Amends plan decision 6 (bounded durable log): resume is an in-memory
-  window plus checksum reconcile; a disk log is an optimisation (section
-  15). Consequently: temporary replication slot, lazy boot with no
-  exported snapshot (amends decision 7's boot clause), on-demand fence
-  instead of a periodic heartbeat table (amends decision 13).
-- **A3. Postgres 18 only.** App A upgrades from 17.4; recommended with
-  it: Electric 1.7.6 -> 1.7.9 so the
-  baseline is one Electric version.
-- **A4. Tiers are evaluation strategies of restricted re-evaluation**;
-  the plan's key decomposition (decision 4) becomes sharing of identical
-  normalised subtrees.
-- **A5. Second app is App A** (private corpus), equal in priority to
-  App B. It adds client parameters with mandatory `$sub` gates and rule
-  groups (section 3).
-- **A6. Review gate before Phase 1** (the plan said before Phase 2).
-- **A8. REPLICA IDENTITY FULL only where old values are read** (Q1
-  resolved): tables inside some rule's subqueries. Other tables keep their
-  identity (never downgraded, so Electric's own FULL settings survive
-  migration). Unchanged TOAST columns of a member row keep their stored
-  value; a row entering a unit with an unsent value is fetched by key.
-  Measured: avoids up to 200x WAL per update on rows with large
-  out-of-line values (`docs/bench/dense.md`); catalogue 11c covers it.
-- **A9. Column-delta updates (`PATCH`).** Units store one hash per
-  projected column per member; an update sends only the columns whose hash
-  changed, plus the new row hash (the client does not keep row bytes). Row
-  hash = sum of column hashes; each row enters the unit checksum through
-  a mix (section 7), so checksums stay additive per row. Measured: a
-  one-int update of a 12 kB row went from 11,973 to 49 bytes (Electric:
-  365); a jsonb edit from 11,976 to 1,686 (Electric: 2,207).
-- **A7. Node is the latest release, pinned by pnpm**: 26.13.0 via
-  `useNodeVersion` (amends the plan's `node >=22.13`; the reference client
-  is sqlite-wasm, so `node:sqlite` is not needed).
-- **A10. Rules have one-table output** (was Q2): a rule is `SELECT
-  <columns or *> FROM <table> WHERE ...`; joins live in subqueries and
-  gates. Every corpus shape from both apps fits.
-- **A11. Gates: SQL for anything revocable, claims for the rest** (was
-  Q4). Both are supported; SQL gates on tables are live (unit gates,
-  section 3.2a), claim conjuncts are fresh only at token refresh.
-- **A12. The reference client is localdb's real code on sqlite-wasm**
-  (was Q6), in Node for the harness and simulation and in headless Chrome
-  for the browser smoke.
-- **A13. Read-your-writes is an app convention, not protocol** (was Q10):
-  the app writes `(client_id, last_mutation_id)` in its transaction and
-  the client wants a rule over its own row; the confirmation arrives in
-  the same atomic frame as the data. No `WAIT` message (catalogue 13).
-- **A14. Public, MIT, like localdb** (was Q7): `LICENSE` matches localdb's;
-  `@nightride/localsync` is published from `ts/transport`.
-- **A15. permessage-deflate, per message, 512-byte threshold** (was
-  Q5). Measured on the engine's real messages (`docs/bench/deflate.md`):
-  initial loads and move-ins shrink ~40%; small deltas compressed alone
-  grow ~10%, so they are sent as they are; context takeover would shrink
-  them ~35% more but keeps a compressor per connection (hundreds of kB in
-  Go), too much at thousands of sockets. Browsers and Node negotiate it
-  natively; `LOCALSYNC_WS_COMPRESSION=0` turns it off. Per-fragment zstd
-  or a trained dictionary stay in the slate (section 15).
-- **A16. Checksum-equal reconnect skip is on** (was Q11), after its
-  root cause was found. Unit checksums summed row hashes that are
-  themselves sums of column hashes, so two states that differ only by
-  values swapped between rows (the simulation's "move project": two
-  projects trading orgs) had equal checksums, and the skip kept the
-  client's stale rows (seed 903 reproduced it every run; seed 321 earlier
-  intermittently). Fixed by mixing each row hash before summing (section
-  7), which also lets drift detection see such swaps. A second, smaller
-  bug: a hold kept the client's `WANT`-time checksum after it started
-  delivering, so a later re-snapshot (history pruned past its cursor)
-  could compare against a state the client had left; that checksum is now
-  dropped on first delivery. After both: seed 903 passes 3 of 3 and a
-  64-seed fault soak 64 of 64 with the skip on. `LOCALSYNC_EQUAL_SKIP=0`
-  turns it off.
-
-- **A17. Shared bodies with per-principal gate units** (section 3.2a):
-  rules whose principal dependence is only in gates are served from one
-  body per project and a gate unit per viewer, falling back to per
-  principal units whenever the split does not apply.
-- **A18. No relaxed delivery; big move-ins apply in bulk** (was Q3).
-  Measured (`docs/bench/movein.md`): a grant bringing in 20,000 rows held
-  another unit's updates for 1.2 s, but the engine sent the move-in 36 ms
-  after the grant; the rest was the client applying it row by row. Large
-  runs of PUTs now take the set-based path snapshots used (previous
-  member hashes read per chunk), and the move-in lands in 215 ms (Electric
-  1,306 ms), so per-unit frontiers would buy at most the 36 ms and cost
-  cross-unit atomicity. Updates behind a big move-in still wait for its
-  apply; chunked application is the next step only if that shows up.
-- **A19. App A's tenant-level and per-project files stay separate** (was
-  Q9). By design: one file for tenant-level data for the session and one
-  per project (many, LRU-evicted), two `LocalDb` instances with no
-  `ATTACH`; the project files deliberately mirror no tenant tables, so no
-  query joins the two and each file gets its own atomic frames. Nothing to build.
-  Re-opening an evicted or idle project reconciles by checksum (A16),
-  and shared bodies (A17) make a project's units shared by its team.
-
-- **A20. `alignCommits` in localdb: one reader for live queries** (was
-  Q8). First built as exact commit labels plus per-reader marks with held
-  delivery; the collab soak showed readers on independent ticks almost
-  never sit on the same commit under steady writes (22 of 31 releases fell
-  back to a timeout, still torn, 600 ms p50). One reader per database for
-  live queries is exact by construction and costs ~6 ms p50 at that load;
-  the marks were removed. Off by default (live-query parallelism matters
-  for heavy aggregates); screens in either app that combine queries
-  should turn it on.
-
-- **A21. HTTP fallback, no WebTransport.**
-  - App A runs on Electric today, which works over plain HTTP. Moving
-    App A to WebSocket-only sync would break it on every customer network
-    where Electric works only because it is plain HTTP. So `/sync/http`
-    (section 9.1) ships with the engine, chosen automatically by the
-    client.
-  - It is one mode that degrades to long polls, not streaming alone,
-    because the proxies that break WebSockets often also buffer
-    responses.
-  - WebTransport (QUIC) is not planned:
-    - Its benefits are separate streams, connection migration and 0-RTT.
-      We deliver one ordered stream per client by design, and a resume
-      already costs about a millisecond.
-    - UDP is often blocked on enterprise networks, so it would need this
-      fallback anyway.
-    - QUIC in Go runs in user space, so it costs more CPU per connection.
-  - Revisit if measured mobile reconnects matter.
-
-- **A22. Default-deny rules; grants in the token; per-deployment
-  audience.**
-  - Electric authorises in each app's proxy, per route. localsync has no
-    routes: any valid token can want any rule. So a rule with no
-    declared access would be readable by everyone, and the first corpus
-    conversion did exactly that (an admin route's shape became a rule
-    with no condition).
-  - Every rule now declares access (section 3.2), or the engine refuses
-    to load it.
-  - Coarse rights travel as `grants` in the token, decided by the app's
-    own code, and are checked at every `WANT`.
-  - Data-derived permissions stay SQL gates, which revoke in the same
-    transaction.
-  - The JWT audience is per deployment (`--audience`): App A runs one
-    engine per tenant database, and with a shared secret a token for one
-    tenant must not open another's engine.
-  - Rejected:
-    - **An app proxy in the middle.** Admitting wants there is what
-      claims do, without proxying WebSockets and the HTTP fallback in
-      every app.
-    - **Filtering rows there.** That would mean decoding frames and
-      recomputing checksums, a second sync engine. Shared bodies (A17)
-      already give common buckets with a small per-viewer part.
-  - Catalogue 10c tests the grant, the refusal, and revocation at the
-    next token.
-  - App B's audit (private, with the corpus) turned every one of its 86
-    routes' middleware into rules:
-    - Its roles are table rows, so each became a unit gate, not a claim.
-      All 86 rules load, with the same tiers as before.
-    - Revocation goes from the next long poll (about 20 s) to the same
-      transaction.
-    - `engine plan`'s Access column (`$sub gate`, `$sub rows`, both,
-      claims, public) is the review surface. It calls a condition "rows"
-      only when the condition provably reads the row's own columns.
-
-## Open questions
-
-None open. New ones go here, with proposals in brackets.
+A relay would be a client of the union of its clients' units: one `WANT`
+upstream, each client's token forwarded to the engine for authorisation,
+per-client frontiers by the same `min` rule, and frames assembled from
+upstream fragments by unit ref without decoding rows.

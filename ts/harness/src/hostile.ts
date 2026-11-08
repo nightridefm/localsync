@@ -13,7 +13,7 @@
 //
 // After every attack the engine must still answer /health.
 //
-//   pnpm --filter @nightride/localsync-harness hostile [--only=leak-params,churn]
+//   pnpm harness hostile [--only=leak-params,churn]
 import { createHmac, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { parseArgs } from 'node:util'
@@ -130,9 +130,9 @@ function rssMiB(pid: number | undefined): number {
 }
 
 /** Waits until the client reports caught up (every want served or failed). */
-async function caughtUp(c: { client: { caughtUp?(): boolean } }, ms = 30_000): Promise<void> {
+async function caughtUp(c: { client: { caughtUp(): boolean } }, ms = 30_000): Promise<void> {
 	const start = Date.now()
-	while (!c.client.caughtUp?.()) {
+	while (!c.client.caughtUp()) {
 		if (Date.now() - start > ms) throw new Fail('client never caught up')
 		await sleep(20)
 	}
@@ -398,6 +398,11 @@ const attacks: Attack[] = [
 					],
 					'error',
 				],
+				[
+					'a second WANT',
+					[want(token, [{ id: 1, rule: 'tags' }]), want(token, [{ id: 2, rule: 'tags' }])],
+					'error',
+				],
 				['binary', [new Uint8Array([1, 2, 3])], 'ignored'],
 				['2 MiB', ['x'.repeat(2 << 20)], 'close'],
 				['deep JSON', ['['.repeat(100_000)], 'error'],
@@ -471,7 +476,7 @@ const attacks: Attack[] = [
 	},
 	{
 		id: 'churn',
-		title: 'one client churning through units cannot grow the engine without bound',
+		title: 'one principal churning through units cannot grow the engine without bound',
 		async run(ctx, adapter) {
 			const p = ctx.principal()
 			await ctx.write((q) =>
@@ -480,34 +485,25 @@ const attacks: Attack[] = [
 			const before = await engineUnits()
 			const rss0 = rssMiB(adapter.enginePid())
 			const token = mintToken(p.sub)
+			// One WANT per connection, so churn is reconnecting with new wants.
 			const rounds = 20
-			const r = await new Promise<string>((resolve) => {
-				const ws = new WebSocket(WS_URL)
-				let i = 0
-				const next = () => {
-					if (i++ >= rounds) return resolve('done')
-					const wants = Array.from({ length: 2000 }, (_, j) => ({
-						id: j + 1,
-						rule: 'project_tasks',
-						params: { project: randomUUID() },
-					}))
-					ws.send(want(token, wants))
-				}
-				ws.onopen = next
-				ws.onmessage = (ev) => {
-					if (typeof ev.data === 'string' && ev.data.includes('"type":"units"')) next()
-					if (typeof ev.data === 'string' && ev.data.includes('"type":"error"'))
-						resolve(`closed: ${ev.data}`)
-				}
-				ws.onclose = () => resolve('closed')
-				ws.onerror = () => {}
-				setTimeout(() => resolve('timeout'), 60_000)
-			})
+			let refused = 0
+			for (let i = 0; i < rounds; i++) {
+				const wants = Array.from({ length: 2000 }, (_, j) => ({
+					id: j + 1,
+					rule: 'project_tasks',
+					params: { project: randomUUID() },
+				}))
+				const r = await probe([want(token, wants)])
+				const units = r.texts.find((t) => t.includes('"type":"units"'))
+				refused += units ? (units.match(/too many new units/g) ?? []).length : 0
+			}
+			const r = `${refused} refused`
 			await sleep(3000)
 			const units = (await engineUnits()) - before
 			const rss = rssMiB(adapter.enginePid()) - rss0
 			await healthy()
-			const note = `${rounds} WANTs x 2000 new units (${r}): ${units} units in memory after, +${rss.toFixed(0)} MiB`
+			const note = `${rounds} connections x 2000 new units (${r}): ${units} units in memory after, +${rss.toFixed(0)} MiB`
 			if (units > 10_000) throw new Fail(note)
 			return note
 		},

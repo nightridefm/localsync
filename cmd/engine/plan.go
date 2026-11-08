@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,28 +15,19 @@ import (
 	"github.com/nightridefm/localsync/internal/rules"
 )
 
-// plan prints how each rule will be evaluated (docs/design.md 3.4).
+// plan prints how each rule will be evaluated (docs/design.md section 3.5).
 func plan(args []string) error {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	pgURL := fs.String("pg", os.Getenv("LOCALSYNC_PG_URL"), "Postgres URL whose catalog the rules are checked against")
 	rulesPath := fs.String("rules", "", "rules.yaml")
-	corpus := fs.String("corpus", "", "corpus shapes.json (Electric shapes, converted to rules)")
-	prefix := fs.String("prefix", "", "with --corpus: only shapes whose file starts with this")
-	gate := fs.String("gate", "", "with --corpus: SQL gate ANDed into rules that use a client parameter")
 	maxTier := fs.Int("max-tier", 3, "exit non-zero if any rule lands above this tier")
 	run := fs.Bool("run", true, "run every rule and gate (read only, one row) with sample parameters, as the engine will")
 	_ = fs.Parse(args)
 
-	var rs []rules.Rule
-	var err error
-	switch {
-	case *rulesPath != "":
-		rs, err = rules.Load(*rulesPath)
-	case *corpus != "":
-		rs, err = corpusRules(*corpus, *prefix, *gate)
-	default:
-		return errors.New("plan needs --rules or --corpus")
+	if *rulesPath == "" {
+		return errors.New("plan needs --rules")
 	}
+	rs, err := rules.Load(*rulesPath)
 	if err != nil {
 		return err
 	}
@@ -66,29 +55,36 @@ func plan(args []string) error {
 			fmt.Printf("| %s | | | rejected | | | | %s |\n", r.Name, md(err.Error()))
 			continue
 		}
+		// A split rule is served by its body and gate units, so the body's
+		// strategy is the rule's.
+		served := a
 		ran := "not run"
 		if *run {
-			shared, err := engine.Check(ctx, pool, cat, a)
+			body, err := engine.Check(ctx, pool, cat, a)
 			switch {
 			case err != nil:
 				failed++
 				ran = "FAILED: " + err.Error()
-			case shared:
-				ran = "ok (shared)"
+			case body != nil:
+				ran = "ok (split)"
 			default:
 				ran = "ok"
 			}
-		}
-		counts[fmt.Sprintf("tier %d", a.Tier)]++
-		worst = max(worst, a.Tier)
-		strategy := "on the row"
-		if !a.Fast {
-			strategy = "restricted queries"
-			if a.Tier == 2 {
-				strategy += " (Phase 4: maintained sets)"
+			if body != nil {
+				served = body
+			}
+		} else if a.Split != nil {
+			if b, err := rules.Analyze(a.Split.Body, cat); err == nil {
+				served = b
 			}
 		}
-		fmt.Printf("| %s | %s | %s | %d | %s | %s | %s | %s |\n", r.Name, a.Table.Name, md(a.Access()), a.Tier, strategy, strings.Join(a.Deps, ", "), md(ran), md(strings.Join(a.Notes, "; ")))
+		counts[fmt.Sprintf("tier %d", served.Tier)]++
+		worst = max(worst, served.Tier)
+		strategy := "on the row"
+		if !served.Fast {
+			strategy = "restricted queries"
+		}
+		fmt.Printf("| %s | %s | %s | %d | %s | %s | %s | %s |\n", r.Name, a.Table.Name, md(a.Access()), served.Tier, strategy, strings.Join(a.Deps, ", "), md(ran), md(strings.Join(a.Notes, "; ")))
 	}
 	fmt.Printf("\n%d rules: tier 1 %d, tier 2 %d, tier 3 %d, rejected %d", len(rs), counts["tier 1"], counts["tier 2"], counts["tier 3"], counts["rejected"])
 	if *run {
@@ -105,69 +101,3 @@ func plan(args []string) error {
 }
 
 func md(s string) string { return strings.ReplaceAll(s, "|", `\|`) }
-
-type shape struct {
-	File    string   `json:"file"`
-	Line    int      `json:"line"`
-	Route   string   `json:"route"`
-	Table   string   `json:"table"`
-	Where   *string  `json:"where"`
-	Columns []string `json:"columns"`
-}
-
-var roleRe = regexp.MustCompile(`/api/([^/]+)/`)
-
-// corpusRules converts Electric shapes into rules: SELECT <columns or *>
-// FROM <table> [WHERE <where>], named role + route.
-func corpusRules(path, prefix, gate string) ([]rules.Rule, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var shapes []shape
-	if err := json.Unmarshal(raw, &shapes); err != nil {
-		return nil, err
-	}
-	var out []rules.Rule
-	seen := map[string]int{}
-	for _, s := range shapes {
-		if !strings.HasPrefix(s.File, prefix) {
-			continue
-		}
-		cols := "*"
-		if len(s.Columns) > 0 {
-			q := make([]string, len(s.Columns))
-			for i, c := range s.Columns {
-				q[i] = rules.Ident(c)
-			}
-			cols = strings.Join(q, ", ")
-		}
-		sql := fmt.Sprintf("SELECT %s FROM %s", cols, rules.Ident(s.Table))
-		where := ""
-		if s.Where != nil && *s.Where != "" {
-			where = *s.Where
-		}
-		r := rules.Rule{}
-		if strings.Contains(where, "$project") {
-			r.ClientParams = []string{"project"}
-			if gate != "" {
-				where = "(" + gate + ") AND (" + where + ")"
-			}
-		}
-		if where != "" {
-			sql += " WHERE " + where
-		}
-		role := "?"
-		if m := roleRe.FindStringSubmatch(s.File); m != nil {
-			role = m[1]
-		}
-		name := role + s.Route
-		if n := seen[name]; n > 0 {
-			name = fmt.Sprintf("%s#%d", name, n+1)
-		}
-		seen[role+s.Route]++
-		r.Name, r.SQL = name, sql
-		out = append(out, r)
-	}
-	return out, nil
-}

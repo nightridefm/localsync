@@ -4,7 +4,7 @@ nginx in front of the engine, configured like the apps' production
 gateways: TLS with a real certificate, HTTP/2 and HTTP/3, gzip on, and
 nginx's default proxy timeouts (60 s) and buffering. It lets the harness,
 the simulation and the browser tests run over `wss://` and `https://`
-the way browsers reach the apps (design section 14.3).
+the way browsers reach the apps (`docs/design.md` section 13).
 
 - `8443`: the harness engine (`127.0.0.1:3141`).
 - `8444`: the browser tests' engine (`127.0.0.1:3142`) and their pages
@@ -29,12 +29,12 @@ LOCALSYNC_TLS_DOMAIN=<hostname with a certificate in it, resolving to 127.0.0.1>
 
 ```sh
 docker compose --profile gateway up -d gateway
-pnpm --filter @nightride/localsync-harness gateway            # wss, https, auto, hostile
+pnpm harness gateway           # wss, https, auto, hostile
 LOCALSYNC_URL=wss://$LOCALSYNC_TLS_DOMAIN:8443/sync \
-  pnpm --filter @nightride/localsync-harness matrix --adapter=localsync
-LOCALSYNC_BROWSER_VIA=gateway pnpm --filter @nightride/localsync-browser smoke
+  pnpm harness matrix
+LOCALSYNC_BROWSER_VIA=gateway pnpm browser smoke
 LOCALSYNC_BROWSER_VIA=hostile LOCALSYNC_TRANSPORT=auto \
-  pnpm --filter @nightride/localsync-browser smoke
+  pnpm browser smoke
 ```
 
 `LOCALSYNC_TRANSPORT` is `websocket` (the harness default), `http` or

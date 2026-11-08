@@ -1,7 +1,7 @@
-# A version tag (v0.1.0) releases both halves of the protocol at once: apps
-# build the engine from the tag (LOCALSYNC_REF=v0.1.0) and install the client
+# A version tag (v0.2.0) releases both halves of the protocol at once: apps
+# build the engine from the tag (LOCALSYNC_REF=v0.2.0) and install the client
 # from the tarball attached here:
-#   https://github.com/nightridefm/localsync/releases/download/v0.1.0/nightride-localsync-0.1.0.tgz
+#   https://github.com/nightridefm/localsync/releases/download/v0.2.0/nightride-localsync-0.2.0.tgz
 # The tag must match ts/transport/package.json's version (bump it first).
 name: release
 

@@ -1,0 +1,54 @@
+# Every push: static checks, the Go and client tests, and the capability
+# catalogue over both transports, the hostile suite and a short faulted
+# simulation, all against the compose Postgres. The browser runs import
+# localdb's source, so localdb is checked out beside this repository, the
+# same layout as a local checkout (../localdb).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: localsync
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: localsync
+      - uses: actions/checkout@v7
+        with:
+          repository: nightridefm/localdb
+          path: localdb
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: localsync/go.mod
+          cache-dependency-path: localsync/go.sum
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: localsync/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26.13.0
+      - run: pnpm install --frozen-lockfile
+        working-directory: localdb
+      - run: pnpm install --frozen-lockfile
+      - run: docker compose up -d --wait
+
+      - run: pnpm check
+      - run: pnpm lint
+      - run: pnpm format:check
+      # The catalogue creates the fixture some Go tests read.
+      - run: pnpm harness matrix
+      - run: LOCALSYNC_SKIP_BUILD=1 LOCALSYNC_TRANSPORT=http pnpm harness matrix
+      - run: pnpm test
+      - run: LOCALSYNC_SKIP_BUILD=1 pnpm harness hostile
+      - run: LOCALSYNC_SKIP_BUILD=1 pnpm sim parallel --jobs 4 --seeds 100-107 --faults

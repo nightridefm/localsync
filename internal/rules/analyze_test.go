@@ -197,14 +197,17 @@ func TestGateAndNotIn(t *testing.T) {
 	if m == nil || !m.Full || m.Narrow == nil {
 		t.Fatalf("gate occurrence %+v", m)
 	}
-	if !a.Fast || len(a.Gates) != 1 || !strings.HasPrefix(a.Gates[0].SQL, "SELECT 1 WHERE EXISTS") {
-		t.Errorf("gated fast rule: fast=%v gates=%v", a.Fast, a.Gates)
+	// Unsplit, the gate is an ordinary subquery; split, the body is a fast
+	// rule and the gate a rule of its own that reads $sub alone (pgx
+	// refuses unused arguments).
+	if a.Split == nil || len(a.Split.Gates) != 1 {
+		t.Fatalf("gated rule not split: %+v", a.Split)
 	}
-	// The gate reads $sub alone (the rule's $2): numbered on its own, it
-	// binds that one value (pgx refuses unused arguments).
-	if g := a.Gates[0]; !strings.Contains(g.SQL, "$1") || strings.Contains(g.SQL, "$2") || !slices.Equal(g.Args, []int{1}) ||
-		!slices.Equal(g.GateArgs([]string{"p1", "u1"}), []string{"u1"}) {
-		t.Errorf("gate parameters: %q args %v", g.SQL, g.Args)
+	if b, err := Analyze(a.Split.Body, c); err != nil || !b.Fast {
+		t.Errorf("body %q: fast=%v err=%v", a.Split.Body.SQL, b != nil && b.Fast, err)
+	}
+	if g, err := Analyze(a.Split.Gates[0].Rule, c); err != nil || !slices.Equal(g.Params, []string{"sub"}) {
+		t.Errorf("gate %q: params %v err=%v", a.Split.Gates[0].Rule.SQL, g.Params, err)
 	}
 	n := analyze(t, c, `SELECT * FROM task WHERE id NOT IN (SELECT task_id FROM comment WHERE body = 'hide')`)
 	if o := occ(n, "comment"); o == nil || !o.NullSensitive || o.Full {

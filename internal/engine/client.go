@@ -3,7 +3,6 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -34,70 +33,72 @@ type outMsg struct {
 // goroutines only exchange messages with it through out and Engine.Do.
 type Client struct {
 	e    *Engine
-	sub  string
 	out  chan outMsg
 	done chan struct{}
 	// queued counts bytes sent to out but not yet written to the socket
 	// (decremented by the writer goroutine).
 	queued atomic.Int64
-	// stream is a frame still being sent in parts; pumping asked marks a
-	// pending request from the writer to queue more.
-	stream  *partStream
+	// pumping marks a pending request from the writer to queue more parts.
 	pumping atomic.Bool
-	holds   map[uint32]*Hold // by the client's own unit id
-	cursor  uint64
-	// removals are refs dropped by the last WANT, sent as RESET in the
-	// next frame together with whatever that WANT added.
-	removals []uint32
-	// forceFrame: send the next frame even if empty, so a client holding
-	// units it no longer wants drops them (inside that frame's transaction).
-	forceFrame bool
-	closed     bool
-	// exp is the current token's expiry. Past it the client gets nothing
-	// more: it must send a WANT with a fresh token before then.
+	closed  bool
+	// exp is the token's expiry. Past it the client gets nothing more: it
+	// must reconnect with a fresh token before then.
 	exp time.Time
-	// grants are the current token's (A22); a WANT for a rule with claims
-	// needs one of them, re-checked on every WANT (token refreshes too).
+	// grants are the token's; a want for a rule with claims needs one.
 	grants []string
 	// http: connected over /sync/http (metrics).
 	http bool
 	// lastSend: when the engine last queued a message; an idle connection
 	// gets a beat so proxies' read timeouts (nginx: 60s) never cut it.
 	lastSend time.Time
-	// synced: "synced" was sent for the current WANT (every hold delivered
-	// or failed). Reset by each WANT.
+	// failed: the engine closed the connection with an error (fail), not
+	// cleanly (end).
+	failed bool
+
+	holds  map[uint32]*Hold // by the client's own unit id; nil before WANT
+	cursor uint64
+	// stream is a frame still being sent in parts.
+	stream *partStream
+	// drop: the client holds units it must drop (no longer wanted, or no
+	// longer served), which it does inside the next frame's transaction:
+	// send that frame even if empty, and only with the units the WANT
+	// added.
+	drop bool
+	// synced: "synced" was sent (every hold delivered or failed).
 	synced bool
-	// budget: new wants this client may still make (newWantBurst at most,
-	// refilled at newWantRate from budgetAt), so churning through wants
-	// cannot flood the database with snapshot queries or the engine with
-	// lingering units.
-	budget   float64
-	budgetAt time.Time
 }
 
-// Hold is a client's view of one unit: waiting for a snapshot, holding an
-// undelivered snapshot at snapB, or following the unit's history.
+// phase is where a hold is in its life: waiting for a snapshot of its
+// unit, holding one not yet delivered, then following the unit's history
+// (live) or, while a gate is closed, holding the unit empty (closed).
+type phase uint8
+
+const (
+	holdWaiting phase = iota
+	holdReady
+	holdLive
+	holdClosed
+)
+
+// Hold is a client's view of one unit.
 type Hold struct {
-	c  *Client
-	u  *Unit
-	id uint32
-	// key identifies the want (rule and every parameter value, $sub
-	// included); u.key is the body's key when the rule is shared.
-	key  string
+	c    *Client
+	u    *Unit
+	id   uint32
 	rule string
-	// gates: for a shared rule, the client holds u's rows only while
-	// every gate holds; off means it holds the unit empty (gate closed).
+	// gates: for a split rule, the client holds u's rows only while
+	// every gate holds.
 	gates []gateHold
-	off   bool
-	// reopen: the gates opened while the client held the unit empty; until
-	// the body snapshot is delivered no frame may pass the cursor.
-	reopen      bool
-	snapPending bool
-	snapB       uint64
-	snapOps     []opRec
-	snapSum     uint64
-	snapReset   bool
-	delivered   bool
+	phase phase
+	// reopen: the gates opened while the hold was closed; until the body
+	// snapshot is delivered no frame may pass the cursor.
+	reopen bool
+	// The snapshot at snapB, while ready. snapReset: deliver it as a RESET
+	// (false when the client's checksum already matches).
+	snapB     uint64
+	snapOps   []opRec
+	snapSum   uint64
+	snapReset bool
 	// haveSum is the client's checksum for the unit as of its WANT; valid
 	// (haveOK) only until the hold first delivers.
 	haveSum uint64
@@ -109,6 +110,9 @@ type Hold struct {
 	broken      bool
 	brokenReset bool
 }
+
+// delivered: the client has the unit's state (empty while closed).
+func (h *Hold) delivered() bool { return h.phase == holdLive || h.phase == holdClosed }
 
 // failure is the error of a unit the hold depends on that keeps failing.
 func (h *Hold) failure() string {
@@ -132,13 +136,12 @@ func (e *Engine) checkFailures(c *Client) (changed bool) {
 		switch {
 		case msg != "" && !h.broken:
 			// A hold behind closed gates is already empty on the client.
-			h.brokenReset = !(h.delivered && h.off)
-			h.broken, h.delivered, h.off, h.reopen, h.haveOK, h.snapOps = true, false, false, false, false, nil
-			h.snapPending = true
+			h.brokenReset = h.phase != holdClosed
+			h.broken, h.phase, h.reopen, h.haveOK, h.snapOps = true, holdWaiting, false, false, nil
 			changed = true
 		case msg == "" && h.broken:
 			h.broken, h.brokenReset = false, false
-			if h.snapPending {
+			if h.phase == holdWaiting {
 				// Unless the recovering query already handed it a snapshot.
 				e.requestSnapshot(h)
 			}
@@ -194,18 +197,15 @@ func (h *Hold) units() []*Unit {
 	return us
 }
 
-// LOCALSYNC_EQUAL_SKIP=0 always resends units on reconnect.
-var equalSkipOff = os.Getenv("LOCALSYNC_EQUAL_SKIP") == "0"
-
 func (h *Hold) setSnapshot(b uint64, ops []opRec, sum uint64) {
-	h.snapPending = false
+	h.phase = holdReady
 	h.snapB = b
 	h.snapSum = sum
-	h.delivered = false
-	// Checksums equal: the client keeps its state (design A16). Should it
+	// Checksums equal: the client keeps its state (docs/design.md section
+	// 7). Should it
 	// still differ, the client's checksum check on later frames flags the
 	// unit as drifted and its next WANT gets it whole.
-	if h.haveOK && h.haveSum == sum && !equalSkipOff {
+	if h.haveOK && h.haveSum == sum && !h.c.e.cfg.NoEqualSkip {
 		// The client already holds exactly this state: send nothing.
 		h.snapOps, h.snapReset = nil, false
 		return
@@ -231,11 +231,11 @@ func (h *Hold) joinable(head uint64) bool {
 }
 
 func (h *Hold) known(head uint64) uint64 {
-	if h.snapPending {
+	if h.phase == holdWaiting {
 		return 0
 	}
 	k := h.u.known(head)
-	if !h.delivered {
+	if h.phase == holdReady {
 		k = max(k, h.snapB)
 	}
 	for _, g := range h.gates {
@@ -290,14 +290,38 @@ func (c *Client) sendJSON(v any) {
 // maxWants bounds the units one connection may hold.
 const maxWants = 2000
 
-// A connection may make newWantBurst new wants at once, then newWantRate a
-// second (a want the client already holds costs nothing). Well above what
-// navigating an app needs; a want over it is refused, and the client's next
-// WANT may ask again.
+// A principal may create newUnitBurst units at once, then newUnitRate a
+// second, across all its connections: churning through random parameters
+// cannot flood the database with snapshot queries or the engine with
+// units. Joining a unit that exists costs nothing, so reconnects and
+// switching back and forth never count. Well above what navigating an app
+// needs; a want over it is refused, and the next WANT may ask again.
 const (
-	newWantBurst = 2 * maxWants
-	newWantRate  = maxWants / 60.0
+	newUnitBurst = 2 * maxWants
+	newUnitRate  = maxWants / 60.0
 )
+
+type unitBudget struct {
+	left float64
+	at   time.Time
+}
+
+// spend takes one new unit from sub's budget, or reports there is none.
+func (e *Engine) spend(sub string) bool {
+	now := time.Now()
+	b := e.budgets[sub]
+	if b == nil {
+		b = &unitBudget{left: newUnitBurst, at: now}
+		e.budgets[sub] = b
+	}
+	b.left = min(newUnitBurst, b.left+now.Sub(b.at).Seconds()*newUnitRate)
+	b.at = now
+	if b.left < 1 {
+		return false
+	}
+	b.left--
+	return true
+}
 
 // maxParamLen bounds a client parameter value (they are ids and keys).
 const maxParamLen = 4096
@@ -323,6 +347,7 @@ func (c *Client) send(m outMsg) {
 	}
 }
 
+// fail closes the connection with an error; the client backs off.
 func (c *Client) fail(msg string) {
 	if c.closed {
 		return
@@ -332,6 +357,13 @@ func (c *Client) fail(msg string) {
 	case c.out <- outMsg{text: true, data: b}:
 	default:
 	}
+	c.failed = true
+	c.e.removeClient(c)
+}
+
+// end closes the connection cleanly, after what is queued: the client
+// reconnects at once and reconciles.
+func (c *Client) end() {
 	c.e.removeClient(c)
 }
 
@@ -370,32 +402,14 @@ func (e *Engine) release(h *Hold) {
 	}
 }
 
-// want applies a WANT: the full desired set of units plus what the client
-// already has (docs/design.md section 7).
+// want applies the connection's one WANT: the full desired set of units
+// plus what the client already has (docs/design.md section 7).
 func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 	e.m.wants++
-	// What the client says it has describes its state only before this
-	// connection's first frame. On a later WANT frames may be in flight
-	// that the client had not applied when it wrote `have` (a removal of
-	// the very unit it now wants back, say), so a new hold then always
-	// gets the unit whole; holds that are kept need nothing.
-	first := c.holds == nil
-	c.synced = false
-	if first {
-		c.holds = map[uint32]*Hold{}
-		if m.Have.Epoch == e.epoch {
-			c.cursor, _ = strconv.ParseUint(m.Have.Cursor, 10, 64)
-		}
+	c.holds = map[uint32]*Hold{}
+	if m.Have.Epoch == e.epoch {
+		c.cursor, _ = strconv.ParseUint(m.Have.Cursor, 10, 64)
 	}
-	if c.sub != "" && c.sub != sub {
-		// A different principal on the same socket: start over.
-		for _, h := range c.holds {
-			c.removals = append(c.removals, h.u.ref)
-			e.release(h)
-		}
-		c.holds = map[uint32]*Hold{}
-	}
-	c.sub = sub
 	have := map[uint32]uint64{}
 	for _, h := range m.Have.Units {
 		if v, err := strconv.ParseUint(h.Checksum, 10, 64); err == nil {
@@ -403,17 +417,7 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 		}
 	}
 	sameEpoch := m.Have.Epoch == e.epoch
-	wanted := map[uint32]bool{}
-	for _, w := range m.Wants {
-		wanted[w.ID] = true
-	}
-	for id := range have {
-		if !wanted[id] {
-			c.forceFrame = true
-		}
-	}
 	var errs []wantErr
-	keep := map[uint32]bool{}
 	for i, w := range m.Wants {
 		if i >= maxWants {
 			errs = append(errs, wantErr{ID: w.ID, Error: fmt.Sprintf("too many wants (limit %d)", maxWants)})
@@ -425,24 +429,15 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 			continue
 		}
 		if len(a.Rule.Claims) > 0 && !slices.ContainsFunc(a.Rule.Claims, func(g string) bool { return slices.Contains(c.grants, g) }) {
-			// Refused, and a hold from an earlier token is dropped below
-			// (not kept), inside the next frame.
 			errs = append(errs, wantErr{ID: w.ID, Error: "not allowed: the token grants none of " + strings.Join(a.Rule.Claims, ", ")})
 			continue
 		}
-		vals := make([]string, len(a.Params))
 		bad := ""
-		for i, name := range a.Params {
-			if name == "sub" {
-				vals[i] = sub
-				continue
-			}
-			v, ok := w.Params[name]
-			if !ok {
+		for _, name := range a.Params {
+			if _, ok := w.Params[name]; !ok && name != "sub" {
 				bad = "missing parameter " + name
 				break
 			}
-			vals[i] = v
 		}
 		for name, v := range w.Params {
 			if !slices.Contains(a.Rule.ClientParams, name) {
@@ -456,30 +451,19 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 			errs = append(errs, wantErr{ID: w.ID, Error: bad})
 			continue
 		}
-		key := w.Rule + "\x00" + strings.Join(vals, "\x00")
-		if h, ok := c.holds[w.ID]; ok {
-			if h.key == key {
-				keep[w.ID] = true
-				continue
-			}
-			c.removals = append(c.removals, h.u.ref)
-			e.release(h)
-			delete(c.holds, w.ID)
+		if c.holds[w.ID] != nil {
+			continue // the same want twice: one id per (rule, params, principal)
 		}
-		now := time.Now()
-		if c.budgetAt.IsZero() {
-			c.budget = newWantBurst
-		} else {
-			c.budget = min(newWantBurst, c.budget+now.Sub(c.budgetAt).Seconds()*newWantRate)
+		served := a
+		if sr := e.splits[a]; sr != nil {
+			served = sr.body
 		}
-		c.budgetAt = now
-		if c.budget < 1 {
-			errs = append(errs, wantErr{ID: w.ID, Error: "too many new wants; ask again later"})
+		if key, _ := unitKey(served, sub, w.Params); e.units[key] == nil && !e.spend(sub) {
+			errs = append(errs, wantErr{ID: w.ID, Error: "too many new units; ask again later"})
 			continue
 		}
-		c.budget--
-		h := &Hold{c: c, id: w.ID, key: key, rule: w.Rule}
-		if sr := e.shared[a]; sr != nil {
+		h := &Hold{c: c, id: w.ID, rule: w.Rule}
+		if sr := e.splits[a]; sr != nil {
 			// One body per non-principal parameters, gates per principal.
 			h.u = e.holdUnit(sr.body, sub, w.Params)
 			for _, g := range sr.gates {
@@ -489,26 +473,25 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 			h.u = e.holdUnit(a, sub, w.Params)
 		}
 		u := h.u
-		if first {
-			h.haveSum, h.haveOK = have[w.ID]
-		}
+		h.haveSum, h.haveOK = have[w.ID]
 		c.holds[w.ID] = h
-		keep[w.ID] = true
 		if sameEpoch && h.haveOK && u.state == ready && c.cursor >= u.histFrom && gatesCover(h, c.cursor) {
 			// Resume: the client's state at its cursor is valid; follow
 			// the unit's history from there. Behind closed gates that
 			// state is the empty unit.
-			h.delivered, h.haveOK = true, false
-			h.off = !h.open(c.cursor)
+			h.phase, h.haveOK = holdLive, false
+			if !h.open(c.cursor) {
+				h.phase = holdClosed
+			}
 			continue
 		}
 		e.requestSnapshot(h)
 	}
-	for id, h := range c.holds {
-		if !keep[id] {
-			c.removals = append(c.removals, h.u.ref)
-			e.release(h)
-			delete(c.holds, id)
+	// Anything the client has that it does not hold now (no longer wanted,
+	// refused, or a token that lost a grant) goes in the next frame.
+	for id := range have {
+		if c.holds[id] == nil {
+			c.drop = true
 		}
 	}
 	descs := make([]unitDesc, 0, len(c.holds))
@@ -533,9 +516,8 @@ func (e *Engine) want(c *Client, sub string, m *wantMsg) {
 	c.sendJSON(map[string]any{"type": "units", "epoch": e.epoch, "units": descs, "errors": errs, "failures": c.failureList()})
 }
 
-// holdUnit finds or creates the unit of a for these parameter values and
-// counts a hold on it.
-func (e *Engine) holdUnit(a *rules.Analysis, sub string, params map[string]string) *Unit {
+// unitKey names the unit of a for these parameter values.
+func unitKey(a *rules.Analysis, sub string, params map[string]string) (string, []string) {
 	vals := make([]string, len(a.Params))
 	for i, name := range a.Params {
 		if name == "sub" {
@@ -544,7 +526,13 @@ func (e *Engine) holdUnit(a *rules.Analysis, sub string, params map[string]strin
 			vals[i] = params[name]
 		}
 	}
-	key := a.Rule.Name + "\x00" + strings.Join(vals, "\x00")
+	return a.Rule.Name + "\x00" + strings.Join(vals, "\x00"), vals
+}
+
+// holdUnit finds or creates the unit of a for these parameter values and
+// counts a hold on it.
+func (e *Engine) holdUnit(a *rules.Analysis, sub string, params map[string]string) *Unit {
+	key, vals := unitKey(a, sub, params)
 	u := e.units[key]
 	if u == nil {
 		u = e.createUnit(a, vals, key)
@@ -599,7 +587,7 @@ func (e *Engine) frame(c *Client, empty bool) {
 			// Failing units hold no one back.
 			continue
 		}
-		if h.snapPending || (!h.delivered && !h.joinable(e.head)) {
+		if h.phase == holdWaiting || (h.phase == holdReady && !h.joinable(e.head)) {
 			waiting = true
 		}
 		f = min(f, h.known(e.head))
@@ -612,7 +600,7 @@ func (e *Engine) frame(c *Client, empty bool) {
 			if h.broken {
 				continue
 			}
-			if h.delivered || (!h.snapPending && h.snapB <= g) {
+			if h.delivered() || (h.phase == holdReady && h.snapB <= g) {
 				g = h.u.valid(g)
 			}
 			for _, gh := range h.gates {
@@ -624,8 +612,8 @@ func (e *Engine) frame(c *Client, empty bool) {
 		}
 		f = g
 	}
-	if waiting && len(c.removals) > 0 {
-		// Removals ride with the additions of the same WANT.
+	if waiting && c.drop {
+		// Drops ride with the additions of the same WANT.
 		return
 	}
 	if f < c.cursor {
@@ -636,13 +624,13 @@ func (e *Engine) frame(c *Client, empty bool) {
 	// at the cursor (the client must not be at an LSN where it may see
 	// rows it does not have yet).
 	for _, h := range c.holds {
-		if h.delivered && h.off && f > c.cursor && h.open(f) {
-			h.delivered, h.off, h.reopen, h.haveOK = false, false, true, false
+		if h.phase == holdClosed && f > c.cursor && h.open(f) {
+			h.phase, h.reopen, h.haveOK = holdWaiting, true, false
 			e.requestSnapshot(h)
 		}
 	}
 	for _, h := range c.holds {
-		if h.reopen && (h.snapPending || h.snapB > f || !gatesCover(h, f) || !h.joinable(e.head)) {
+		if h.reopen && (h.phase == holdWaiting || h.snapB > f || !gatesCover(h, f) || !h.joinable(e.head)) {
 			return
 		}
 	}
@@ -651,13 +639,7 @@ func (e *Engine) frame(c *Client, empty bool) {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	// Removals first: an id the client re-wanted with new parameters must
-	// not be wiped by the removal of its old unit.
 	var frags []frag
-	for _, ref := range c.removals {
-		frags = append(frags, frag{ref: ref, reset: true})
-	}
-	c.removals = nil
 	for _, id := range ids {
 		h := c.holds[id]
 		if h.broken {
@@ -667,18 +649,18 @@ func (e *Engine) frame(c *Client, empty bool) {
 			}
 			continue
 		}
-		if h.snapPending {
+		if h.phase == holdWaiting {
 			continue
 		}
 		u := h.u
-		if !h.delivered {
+		if h.phase == holdReady {
 			if h.snapB > f || !gatesCover(h, f) || !h.joinable(e.head) {
 				continue
 			}
 			if !h.open(f) {
 				// Behind closed gates the client holds the unit empty.
 				frags = append(frags, frag{ref: u.ref, reset: true})
-				h.delivered, h.off, h.reopen, h.snapOps, h.haveOK = true, true, false, nil, false
+				h.phase, h.reopen, h.snapOps, h.haveOK = holdClosed, false, nil, false
 				continue
 			}
 			// Snapshot rows and later history fold into one net op per row:
@@ -694,16 +676,16 @@ func (e *Engine) frame(c *Client, empty bool) {
 			// From here the client's state follows the unit, so the checksum
 			// it sent with WANT no longer describes it; a later re-snapshot
 			// (history pruned past its cursor) must resend, never skip.
-			h.delivered, h.snapOps, h.haveOK, h.off, h.reopen = true, nil, false, false, false
+			h.phase, h.snapOps, h.haveOK, h.reopen = holdLive, nil, false, false
 			continue
 		}
-		if h.off {
+		if h.phase == holdClosed {
 			continue
 		}
 		if !h.open(f) {
 			// A gate closed: the client's copy goes, in this frame.
 			frags = append(frags, frag{ref: u.ref, reset: true})
-			h.off = true
+			h.phase = holdClosed
 			continue
 		}
 		ops, sum, n := merged(u, c.cursor, f)
@@ -716,18 +698,18 @@ func (e *Engine) frame(c *Client, empty bool) {
 	// holds every unit it can have, at one LSN.
 	synced := !c.synced
 	for _, h := range c.holds {
-		if !h.broken && (!h.delivered || h.reopen) {
+		if !h.broken && (!h.delivered() || h.reopen) {
 			synced = false
 		}
 	}
-	if len(frags) == 0 && !c.forceFrame && (!empty || f == c.cursor) {
+	if len(frags) == 0 && !c.drop && (!empty || f == c.cursor) {
 		if synced {
 			c.synced = true
 			c.sendJSON(syncedMsg)
 		}
 		return
 	}
-	c.forceFrame = false
+	c.drop = false
 	c.cursor = f
 	c.synced = c.synced || synced
 	c.stream = &partStream{lsn: f, frags: frags, synced: synced}

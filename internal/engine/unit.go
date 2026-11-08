@@ -73,7 +73,6 @@ type Unit struct {
 	// holding rows or old values.
 	members map[string][]uint64
 	sum     uint64
-	gateOK  bool
 	// created is the boundary of the creating query; regHead the stream
 	// head when the unit was registered (the result must be at or past it).
 	created uint64
@@ -220,7 +219,7 @@ func (u *Unit) putCols(key string, vals [][]byte, known []bool, absolute bool) b
 // hashes) as an absolute PUT, never a PATCH: a PATCH is relative to the
 // unit's own state, and resolutions are what bring clients that joined
 // mid-gap onto that state. PATCH is only emitted from transaction entries,
-// where history is continuous. (Found by the smash simulation, seed 321.)
+// where history is continuous.
 func (u *Unit) putRow(key string, row []byte, hashes []uint64) {
 	stored, member := u.members[key]
 	same := member
@@ -264,14 +263,12 @@ func (u *Unit) remove(key string) {
 	u.cur = append(u.cur, opRec{key: key, op: wire.Op{Kind: wire.OpRemove, Bytes: []byte(key)}})
 }
 
-// commit closes the current entry at lsn.
+// commit closes the current entry at lsn, if the transaction changed the
+// unit.
 func (u *Unit) commit(lsn uint64) {
-	if len(u.cur) == 0 {
-		return
+	if len(u.cur) > 0 {
+		u.commitResolution(lsn, lsn)
 	}
-	u.hist = append(u.hist, entry{lsn: lsn, ops: u.cur, checksum: u.sum, gapFrom: lsn, count: len(u.members)})
-	u.histBytes += opBytes(u.cur)
-	u.cur = nil
 }
 
 func opBytes(ops []opRec) int {
@@ -347,9 +344,6 @@ func (u *Unit) pkRestriction(c change) restriction {
 
 // fastChange applies an own-table change to a fast (row-local) unit.
 func (u *Unit) fastChange(c change) {
-	if len(u.a.Gates) > 0 && !u.gateOK {
-		return
-	}
 	if u.predicateNeedsUnknown(c.unknown) {
 		u.fetch(c)
 		return

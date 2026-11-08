@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import type { Db, Query } from './pg.ts'
 import type { Rule } from './rules.ts'
 
-export const FIXTURE_VERSION = '2'
+export const FIXTURE_VERSION = '3'
 
 export const FIXTURE_TABLES = [
 	'org',
@@ -24,6 +24,8 @@ export const FIXTURE_TABLES = [
 const DDL = `
 CREATE TABLE org (id uuid PRIMARY KEY, name text NOT NULL);
 CREATE TABLE member (id uuid PRIMARY KEY, org_id uuid NOT NULL, user_id text NOT NULL, role text);
+-- Rules may filter through views; the engine expands them into their tables.
+CREATE VIEW admin_member AS SELECT org_id, user_id FROM member WHERE role = 'admin';
 CREATE TABLE project (id uuid PRIMARY KEY, org_id uuid NOT NULL, name text NOT NULL, archived bool NOT NULL DEFAULT false);
 CREATE TABLE tag (id uuid PRIMARY KEY, label text NOT NULL);
 CREATE TABLE project_tag (id uuid PRIMARY KEY, project_id uuid NOT NULL, tag_id uuid NOT NULL);
@@ -35,7 +37,7 @@ CREATE TABLE kitchen_sink (
 	ts timestamptz, tsn timestamp, d date, j jsonb, arr text[], iarr int[],
 	big text, note text
 );
--- Read-your-writes convention (docs/design.md Q10): the app records the
+-- Read-your-writes convention (docs/design.md section 12): the app records the
 -- last mutation it applied for a client inside the same transaction.
 CREATE TABLE client_mutation (client_id text PRIMARY KEY, last_id bigint NOT NULL);
 CREATE INDEX ON member (user_id);
@@ -109,8 +111,21 @@ export async function ensureFixture(db: Db): Promise<boolean> {
 	return true
 }
 
+/**
+ * Empties the fixture. The engine may still be running a query over several
+ * of these tables (a unit re-evaluating after the last scenario's writes),
+ * and TRUNCATE locks them in its own order, so Postgres can abort either
+ * side as a deadlock. The engine retries its query; so does this.
+ */
 export async function resetData(db: Db): Promise<void> {
-	await db.query(`TRUNCATE ${FIXTURE_TABLES.join(', ')}`)
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await db.query(`TRUNCATE ${FIXTURE_TABLES.join(', ')}`)
+			return
+		} catch (err) {
+			if ((err as { code?: unknown }).code !== '40P01' || attempt === 5) throw err
+		}
+	}
 }
 
 export type World = { orgs: string[]; projects: string[]; tasks: string[] }

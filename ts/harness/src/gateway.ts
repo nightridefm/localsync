@@ -7,7 +7,7 @@
 // one.
 //
 //   docker compose --profile gateway up -d gateway
-//   pnpm --filter @nightride/localsync-harness gateway [--idle 75] [--only wss,https,hostile]
+//   pnpm harness gateway [--idle 75] [--only wss,https,hostile]
 import { randomUUID } from 'node:crypto'
 import { parseArgs } from 'node:util'
 

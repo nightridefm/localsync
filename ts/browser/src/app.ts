@@ -20,7 +20,6 @@ const db = new LocalDb(
 		dbName: `localsync-smoke-${params.get('run')}.db`,
 		schemaSql: SCHEMA,
 		schemaVersion: 1,
-		shapes: [],
 		// 3: the task and comment queries pin to different readers (table
 		// affinity), which is where cross-query tearing can happen.
 		readers: 3,

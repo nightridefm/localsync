@@ -4,8 +4,8 @@
 	"type": "module",
 	"scripts": {
 		"check": "tsc -p tsconfig.json",
-		"smash": "node --disable-warning=ExperimentalWarning src/smash.ts",
-		"parallel": "node --disable-warning=ExperimentalWarning src/parallel.ts"
+		"smash": "node src/smash.ts",
+		"parallel": "node src/parallel.ts"
 	},
 	"dependencies": {
 		"@nightride/localsync-harness": "workspace:*"

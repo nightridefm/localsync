@@ -11,30 +11,27 @@ import (
 	"github.com/nightridefm/localsync/internal/rules"
 )
 
-// Check runs a rule the way the engine will: every gate and the body, as a
-// whole-unit query and as a restricted one, through the same code (query.run)
-// with sample parameter values, plus the shared body and gates when the rule
-// is shared. Analysis alone accepts SQL that fails only when run (a gate
-// bound with parameters it does not read, a cast of a parameter). Read only;
-// bodies are limited to one row. shared reports whether the rule is shared.
-func Check(ctx context.Context, pool *pgxpool.Pool, cat *catalog.Catalog, a *rules.Analysis) (shared bool, err error) {
-	if err := probe(ctx, pool, a); err != nil {
-		return false, err
-	}
+// Check runs a rule the way the engine will serve it, through the same
+// code (query.run) with sample parameter values: a split rule as its body
+// and each gate, any other as itself, each as a whole-unit query and as a
+// restricted one. Analysis alone accepts SQL that fails only when run (a
+// cast of a parameter). Read only; at most one row per query. body is the
+// body's analysis when the rule is split, nil otherwise.
+func Check(ctx context.Context, pool *pgxpool.Pool, cat *catalog.Catalog, a *rules.Analysis) (body *rules.Analysis, err error) {
 	e := &Engine{pool: pool}
-	sr := e.shareRule(ctx, a, cat)
+	sr := e.splitOf(ctx, a, cat)
 	if sr == nil {
-		return false, nil
+		return nil, probe(ctx, pool, a)
 	}
 	if err := probe(ctx, pool, sr.body); err != nil {
-		return true, fmt.Errorf("shared body: %w", err)
+		return sr.body, fmt.Errorf("body: %w", err)
 	}
 	for i, g := range sr.gates {
 		if err := probe(ctx, pool, g.a); err != nil {
-			return true, fmt.Errorf("shared gate %d: %w", i, err)
+			return sr.body, fmt.Errorf("gate %d: %w", i, err)
 		}
 	}
-	return true, nil
+	return sr.body, nil
 }
 
 func probe(ctx context.Context, pool *pgxpool.Pool, a *rules.Analysis) error {
@@ -46,8 +43,8 @@ func probe(ctx context.Context, pool *pgxpool.Pool, a *rules.Analysis) error {
 	u.proj = newProjection(a.Table, a.Columns)
 	u.qproj = queryProjection(u.proj)
 	for _, q := range []*query{
-		{u: u, full: true, probe: true},
-		{u: u, probe: true, restr: []restriction{{sql: "false"}}},
+		{u: u, full: true, use: forProbe},
+		{u: u, use: forProbe, restr: []restriction{{sql: "false"}}},
 	} {
 		q.run(ctx, pool, "")
 		if q.err != nil {

@@ -1,8 +1,8 @@
-// Benchmarks, separate from pass/fail (docs/design.md 14.3): initial load,
-// change latency (commit to local commit) and bytes per change, for each
-// adapter on the same fixture and reference client. Writes docs/bench/.
+// Benchmarks, separate from pass/fail (docs/design.md section 13): initial
+// load, change latency (commit to local commit) and bytes per change, on
+// the fixture and reference client. Writes docs/bench/.
 //
-//   pnpm --filter @nightride/localsync-harness bench [--adapter=localsync,electric] [--rows=10000]
+//   pnpm harness bench [--rows=10000] [--write]
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -10,7 +10,6 @@ import { parseArgs } from 'node:util'
 
 import type { Adapter } from './adapter.ts'
 import { introspect } from './catalog.ts'
-import { ElectricAdapter } from './electric.ts'
 import { ensureFixture, resetData, seedWorld } from './fixture.ts'
 import { buildEngine, LocalsyncAdapter } from './localsync.ts'
 import { Db } from './pg.ts'
@@ -18,7 +17,6 @@ import { Ctx } from './scenario.ts'
 
 const { values } = parseArgs({
 	options: {
-		adapter: { type: 'string', default: 'localsync,electric' },
 		rows: { type: 'string', default: '10000' },
 		changes: { type: 'string', default: '200' },
 		write: { type: 'boolean', default: false },
@@ -157,19 +155,13 @@ async function bench(adapter: Adapter, db: Db): Promise<Result> {
 
 const db = new Db()
 const results: Result[] = []
-for (const name of values.adapter!.split(',')) {
-	let adapter: Adapter
-	if (name === 'electric') adapter = new ElectricAdapter()
-	else {
-		buildEngine()
-		adapter = new LocalsyncAdapter()
-	}
-	if ((await ensureFixture(db)) && adapter.schemaReset) await adapter.schemaReset(db)
-	const r = await bench(adapter, db)
-	await adapter.close()
-	results.push(r)
-	console.log(JSON.stringify(r))
-}
+buildEngine()
+const adapter: Adapter = new LocalsyncAdapter()
+if (await ensureFixture(db)) await adapter.schemaReset(db)
+const r = await bench(adapter, db)
+await adapter.close()
+results.push(r)
+console.log(JSON.stringify(r))
 await db.close()
 
 if (values.write) {
@@ -181,9 +173,9 @@ if (values.write) {
 		`rules (tasks via project via member, comments one level deeper) over ${rows}`,
 		'tasks with one comment each, on the reference client (in-memory',
 		'sqlite-wasm in Node) against the compose Postgres 18. Latency is from the',
-		'write committing to the local commit that shows it. Bytes are payload',
-		'bytes after decompression (Electric) / as received (localsync, which is',
-		'not compressed yet). Single machine, not a load test.',
+		'write committing to the local commit that shows it. Bytes are message',
+		'payload bytes before any transport compression (`deflate.md` measures',
+		'that). Single machine, not a load test.',
 		'',
 		'| Engine | Initial load | Load bytes | Update p50 | Update p99 | Bytes / update | 2-table txn p50 | Insert p50 | Grant (20 rows) p50 |',
 		'| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
